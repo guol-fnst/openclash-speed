@@ -55,3 +55,9 @@
 - V1.3 adds an hourly X activity trigger that reuses the existing Google-network
   throughput benchmark. It requires measured improvement over the current node
   before switching and intentionally does not present that proxy as X truth.
+- V1.3.2 gates that trigger on real X download activity: after presence and the
+  cheap cooldown checks, it samples `/connections` again over
+  `X_ACTIVITY_WINDOW_SECONDS` and requires at least `X_MIN_ACTIVITY_BYTES` from a
+  single device. A prior version only checked that X connections existed, so an
+  idle background X app could burn the hourly benchmark and two idle devices
+  spammed `x_multi_device_deferred` every minute; both now stay silent.

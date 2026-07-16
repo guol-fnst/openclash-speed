@@ -1,4 +1,4 @@
-# OpenClash YouTube/X MEDIA selector V1.3.1
+# OpenClash YouTube/X MEDIA selector V1.3.2
 
 This directory is the reviewable source of the router deployment.
 `config.example` deliberately defaults to `ENABLED=0`; the deployed router
@@ -19,7 +19,7 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 There is intentionally no installer script. Deployment remains a separate,
 explicit and backed-up operation.
 
-## Exact V1.3.1 behavior
+## Exact V1.3.2 behavior
 
 Every cron run takes a kernel `flock`. It then handles a durable pending
 transaction before looking at `ENABLED`:
@@ -29,6 +29,7 @@ OpenClash API unavailable -> leave pending untouched, exit
 pending exists            -> recover/finish it, exit
 ENABLED != 1              -> exit
 no current googlevideo/X  -> exit after one /connections read
+                             (X present adds one short activity sampling window)
 ```
 
 When enabled and real Googlevideo traffic exists:
@@ -150,9 +151,14 @@ If a second device begins during the challenge observation, the result becomes
 inconclusive and rolls back.
 
 YouTube remains the primary optimizer and uses real Googlevideo delivery as its
-final verdict. X/Twitter traffic is also an activity trigger. When X is active
-without concurrent Googlevideo traffic, at most once per hour the script runs
-the existing current-node plus candidate `dl.google.com` throughput comparison.
+final verdict. X/Twitter traffic is also an activity trigger. X presence alone is
+not enough: after a matching connection is seen, the script samples `/connections`
+again over a short `X_ACTIVITY_WINDOW_SECONDS` window and requires at least
+`X_MIN_ACTIVITY_BYTES` of measured download delivery from a single device, so an
+idle background X app neither probes nor emits a multi-device deferral. When that
+active-usage check passes without concurrent Googlevideo traffic, at most once per
+hour the script runs the existing current-node plus candidate `dl.google.com`
+throughput comparison.
 The current-node benchmark is retried once. A probe that cannot form a valid
 comparison backs off for 5 minutes; only a completed comparison consumes the
 normal one-hour cooldown.

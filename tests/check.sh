@@ -27,6 +27,10 @@ x_cooldown="$(sed -n 's/^X_PROBE_COOLDOWN_SECONDS=//p' "$CONFIG")"
 [ "$x_cooldown" = 3600 ]
 x_failure_backoff="$(sed -n 's/^X_PROBE_FAILURE_BACKOFF_SECONDS=//p' "$CONFIG")"
 [ "$x_failure_backoff" = 300 ]
+x_activity_window="$(sed -n 's/^X_ACTIVITY_WINDOW_SECONDS=//p' "$CONFIG")"
+[ "$x_activity_window" = 3 ]
+x_min_activity="$(sed -n 's/^X_MIN_ACTIVITY_BYTES=//p' "$CONFIG")"
+[ "$x_min_activity" = 65536 ]
 stall_enabled="$(sed -n 's/^STALL_PROBE_ENABLED=//p' "$CONFIG")"
 [ "$stall_enabled" = 1 ]
 inconclusive_count="$(sed -n 's/^INCONCLUSIVE_REQUIRED_COUNT=//p' "$CONFIG")"

@@ -25,6 +25,11 @@ X_PROBE_COOLDOWN_SECONDS=3600
 # A probe that cannot form a valid current-vs-candidate comparison may retry
 # much sooner; it does not consume the normal one-hour completion cooldown.
 X_PROBE_FAILURE_BACKOFF_SECONDS=300
+# Real X usage must deliver at least X_MIN_ACTIVITY_BYTES within a short
+# X_ACTIVITY_WINDOW_SECONDS sample so idle background app connections neither
+# probe nor defer.
+X_ACTIVITY_WINDOW_SECONDS=3
+X_MIN_ACTIVITY_BYTES=65536
 
 # Passive YouTube measurement. All rates are BYTES per second.
 # 1,000,000 bytes/s is approximately 8 Mbps and leaves margin for 1080p.

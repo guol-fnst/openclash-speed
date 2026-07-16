@@ -25,6 +25,8 @@ CONFIG="${CONFIG:-/etc/openclash/speed-select/config}"
 : "${X_TRIGGER_ENABLED:=1}"
 : "${X_PROBE_COOLDOWN_SECONDS:=3600}"
 : "${X_PROBE_FAILURE_BACKOFF_SECONDS:=300}"
+: "${X_ACTIVITY_WINDOW_SECONDS:=3}"
+: "${X_MIN_ACTIVITY_BYTES:=65536}"
 : "${YOUTUBE_TARGET_BYTES_PER_SEC:=1000000}"
 : "${LOW_WINDOW_SECONDS:=8}"
 : "${LOW_REQUIRED_WINDOWS:=3}"
@@ -79,6 +81,7 @@ for value in "$BENCH_PROXY_PORT" "$MAX_DELAY_MS" "$MAX_CHALLENGERS" \
     "$CHAIN_VERIFY_SECONDS" "$CHAIN_VERIFY_RATE_BYTES_PER_SEC" \
     "$X_TRIGGER_ENABLED" "$X_PROBE_COOLDOWN_SECONDS" \
     "$X_PROBE_FAILURE_BACKOFF_SECONDS" \
+    "$X_ACTIVITY_WINDOW_SECONDS" "$X_MIN_ACTIVITY_BYTES" \
     "$YOUTUBE_TARGET_BYTES_PER_SEC" "$LOW_WINDOW_SECONDS" \
     "$LOW_REQUIRED_WINDOWS" "$LOW_MIN_ACTIVE_SECONDS" "$LOW_MIN_BYTES" \
     "$LOW_STREAK_MAX_GAP_SECONDS" "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" \
@@ -509,7 +512,9 @@ HAS_GOOGLEVIDEO="$(printf '%s' "$GATE_CONNECTIONS" | jq -r \
 TRIGGER_KIND=youtube
 if [ "$HAS_GOOGLEVIDEO" != true ]; then
     [ "$X_TRIGGER_ENABLED" = 1 ] || exit 0
-    X_SOURCE_IPS="$(printf '%s' "$GATE_CONNECTIONS" | jq -c \
+    # Cheap presence map from the gate snapshot: {id:{download,source}} for X
+    # connections owned by MEDIA and the current node. Empty means no X at all.
+    X_PRESENT_MAP="$(printf '%s' "$GATE_CONNECTIONS" | jq -c \
         --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" '
         def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
           ($h == "x.com" or ($h | endswith(".x.com")) or
@@ -517,14 +522,12 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
            $h == "twimg.com" or ($h | endswith(".twimg.com")));
         [.connections[]? | select(xtraffic) |
           select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
-          (.metadata.sourceIP // "") | select(length>0)] | unique' 2>/dev/null)" || exit 0
-    X_SOURCE_COUNT="$(printf '%s' "$X_SOURCE_IPS" | jq -r 'length')"
-    [ "$X_SOURCE_COUNT" -gt 0 ] || exit 0
-    if [ "$X_SOURCE_COUNT" -ne 1 ]; then
-        event x_multi_device_deferred "$(jq -nc --argjson sources "$X_SOURCE_IPS" '{source_ips:$sources}')"
-        exit 0
-    fi
+          {key:.id,value:{download:(.download // 0),source:(.metadata.sourceIP // "")}}] | from_entries' 2>/dev/null)" || exit 0
+    [ -n "$X_PRESENT_MAP" ] || exit 0
+    [ "$X_PRESENT_MAP" = '{}' ] && exit 0
 
+    # Silent cooldowns before the sampling delay so a cooldown period does not
+    # pay the sleep cost every minute.
     NOW="$(date +%s)"
     LAST_X_PROBE=0
     [ -r "$LAST_X_PROBE_FILE" ] && LAST_X_PROBE="$(cat "$LAST_X_PROBE_FILE" 2>/dev/null)"
@@ -536,6 +539,43 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
     is_uint "$LAST_X_PROBE_FAILURE" || LAST_X_PROBE_FAILURE=0
     [ $((NOW - LAST_X_PROBE_FAILURE)) -ge "$X_PROBE_FAILURE_BACKOFF_SECONDS" ] || exit 0
 
+    # Short activity window: a connection present in the first snapshot counts
+    # only its positive download delta; a connection first seen now counts its
+    # full download, matching sample_googlevideo's attribution rule.
+    sleep "$X_ACTIVITY_WINDOW_SECONDS"
+    X_SNAPSHOT="$(api "$API_BASE/connections" 2>/dev/null)" || exit 0
+    X_ACTIVE_MAP="$(printf '%s' "$X_SNAPSHOT" | jq -c \
+        --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" --argjson old "$X_PRESENT_MAP" '
+        def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
+          ($h == "x.com" or ($h | endswith(".x.com")) or
+           $h == "twitter.com" or ($h | endswith(".twitter.com")) or
+           $h == "twimg.com" or ($h | endswith(".twimg.com")));
+        [.connections[]? | select(xtraffic) |
+          select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+          . as $x | ($old[$x.id] // null) as $p |
+          {source:($x.metadata.sourceIP // ""),
+           delta:(if $p==null then ($x.download // 0) else (($x.download // 0)-($p.download // 0)) end)}]
+        | [.[] | select(.delta>0 and (.source|length>0))] as $active
+        | ([$active[].source] | unique) as $sources
+        | [$sources[] as $s | {key:$s,value:([$active[] | select(.source==$s) | .delta] | add)}] | from_entries' 2>/dev/null)" || exit 0
+    [ -n "$X_ACTIVE_MAP" ] || exit 0
+
+    X_ACTIVE_COUNT="$(printf '%s' "$X_ACTIVE_MAP" | jq -r 'length')"
+    is_uint "$X_ACTIVE_COUNT" || exit 0
+    [ "$X_ACTIVE_COUNT" -gt 0 ] || exit 0
+    if [ "$X_ACTIVE_COUNT" -ne 1 ]; then
+        event x_multi_device_deferred "$(jq -nc --argjson sources "$X_ACTIVE_MAP" '{source_bytes:$sources}')"
+        exit 0
+    fi
+
+    X_ACTIVITY_SOURCE="$(printf '%s' "$X_ACTIVE_MAP" | jq -r 'to_entries[0].key')"
+    X_ACTIVITY_BYTES="$(printf '%s' "$X_ACTIVE_MAP" | jq -r 'to_entries[0].value')"
+    is_uint "$X_ACTIVITY_BYTES" || exit 0
+    # Heartbeat-level traffic from an idle app is not real usage.
+    [ "$X_ACTIVITY_BYTES" -ge "$X_MIN_ACTIVITY_BYTES" ] || exit 0
+
+    # The sleep made the pre-sample NOW stale; refresh before backoff and marker.
+    NOW="$(date +%s)"
     LAST_ATTEMPT=0
     [ -r "$LAST_ATTEMPT_FILE" ] && LAST_ATTEMPT="$(cat "$LAST_ATTEMPT_FILE" 2>/dev/null)"
     is_uint "$LAST_ATTEMPT" || LAST_ATTEMPT=0
@@ -545,13 +585,14 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
     fi
 
     TRIGGER_KIND=x
-    TRIGGER_SOURCE="$(printf '%s' "$X_SOURCE_IPS" | jq -r '.[0]')"
+    TRIGGER_SOURCE="$X_ACTIVITY_SOURCE"
     # Start with a short failure marker. Only a valid current-vs-candidate
     # comparison promotes this run to the normal one-hour completion cooldown.
     durable_write "$LAST_X_PROBE_FAILURE_FILE" "$NOW" || exit 1
     event x_access_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" \
         --argjson cooldown "$X_PROBE_COOLDOWN_SECONDS" --argjson failure_backoff "$X_PROBE_FAILURE_BACKOFF_SECONDS" \
-        '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,failure_backoff_seconds:$failure_backoff,benchmark:"dl.google.com"}')"
+        --argjson activity_bytes "$X_ACTIVITY_BYTES" --argjson activity_window "$X_ACTIVITY_WINDOW_SECONDS" \
+        '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,failure_backoff_seconds:$failure_backoff,activity_bytes:$activity_bytes,activity_window_seconds:$activity_window,benchmark:"dl.google.com"}')"
 fi
 
 if [ "$TRIGGER_KIND" = youtube ]; then
