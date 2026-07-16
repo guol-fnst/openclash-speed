@@ -1,4 +1,4 @@
-# OpenClash YouTube/X MEDIA selector V1.3.2
+# OpenClash YouTube/X MEDIA selector V1.3.3
 
 This directory is the reviewable source of the router deployment.
 `config.example` deliberately defaults to `ENABLED=0`; the deployed router
@@ -19,7 +19,7 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 There is intentionally no installer script. Deployment remains a separate,
 explicit and backed-up operation.
 
-## Exact V1.3.2 behavior
+## Exact V1.3.3 behavior
 
 Every cron run takes a kernel `flock`. It then handles a durable pending
 transaction before looking at `ENABLED`:
@@ -159,6 +159,10 @@ idle background X app neither probes nor emits a multi-device deferral. When tha
 active-usage check passes without concurrent Googlevideo traffic, at most once per
 hour the script runs the existing current-node plus candidate `dl.google.com`
 throughput comparison.
+Per-device byte totals are filtered by that minimum before multi-device counting,
+so a heartbeat from another idle device cannot defer an active user. Googlevideo
+is checked again after the activity window and immediately before writing pending;
+if YouTube appeared meanwhile, the X run exits without changing MEDIA.
 The current-node benchmark is retried once. A probe that cannot form a valid
 comparison backs off for 5 minutes; only a completed comparison consumes the
 normal one-hour cooldown.

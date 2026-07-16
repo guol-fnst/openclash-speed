@@ -499,15 +499,19 @@ log_passive_window()
 CURRENT_NODE="$(selected_node "$MEDIA_GROUP")"
 [ -n "$CURRENT_NODE" ] || exit 0
 
+connections_have_googlevideo()
+{
+    jq -r --arg group "$MEDIA_GROUP" --arg node "$1" '
+        def gv: (.metadata.host // "" | ascii_downcase) as $h |
+          ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
+        any(.connections[]?;
+          gv and (((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null))'
+}
+
 # Cheap activity gate. YouTube retains priority when both services are active;
 # otherwise real X/Twitter traffic may start the same active candidate test.
 GATE_CONNECTIONS="$(api "$API_BASE/connections" 2>/dev/null)" || exit 0
-HAS_GOOGLEVIDEO="$(printf '%s' "$GATE_CONNECTIONS" | jq -r \
-    --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" '
-    def gv: (.metadata.host // "" | ascii_downcase) as $h |
-      ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
-    any(.connections[]?;
-      gv and (((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null))' 2>/dev/null)" || exit 0
+HAS_GOOGLEVIDEO="$(printf '%s' "$GATE_CONNECTIONS" | connections_have_googlevideo "$CURRENT_NODE" 2>/dev/null)" || exit 0
 
 TRIGGER_KIND=youtube
 if [ "$HAS_GOOGLEVIDEO" != true ]; then
@@ -544,8 +548,14 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
     # full download, matching sample_googlevideo's attribution rule.
     sleep "$X_ACTIVITY_WINDOW_SECONDS"
     X_SNAPSHOT="$(api "$API_BASE/connections" 2>/dev/null)" || exit 0
+    X_SAMPLE_HAS_GOOGLEVIDEO="$(printf '%s' "$X_SNAPSHOT" | connections_have_googlevideo "$CURRENT_NODE" 2>/dev/null)" || exit 0
+    if [ "$X_SAMPLE_HAS_GOOGLEVIDEO" = true ]; then
+        event x_probe_deferred '{"cause":"youtube_became_active","stage":"activity_window"}'
+        exit 0
+    fi
     X_ACTIVE_MAP="$(printf '%s' "$X_SNAPSHOT" | jq -c \
-        --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" --argjson old "$X_PRESENT_MAP" '
+        --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" --argjson old "$X_PRESENT_MAP" \
+        --argjson min "$X_MIN_ACTIVITY_BYTES" '
         def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
           ($h == "x.com" or ($h | endswith(".x.com")) or
            $h == "twitter.com" or ($h | endswith(".twitter.com")) or
@@ -557,7 +567,8 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
            delta:(if $p==null then ($x.download // 0) else (($x.download // 0)-($p.download // 0)) end)}]
         | [.[] | select(.delta>0 and (.source|length>0))] as $active
         | ([$active[].source] | unique) as $sources
-        | [$sources[] as $s | {key:$s,value:([$active[] | select(.source==$s) | .delta] | add)}] | from_entries' 2>/dev/null)" || exit 0
+        | [$sources[] as $s | {key:$s,value:([$active[] | select(.source==$s) | .delta] | add)}]
+        | from_entries | with_entries(select(.value >= $min))' 2>/dev/null)" || exit 0
     [ -n "$X_ACTIVE_MAP" ] || exit 0
 
     X_ACTIVE_COUNT="$(printf '%s' "$X_ACTIVE_MAP" | jq -r 'length')"
@@ -571,9 +582,6 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
     X_ACTIVITY_SOURCE="$(printf '%s' "$X_ACTIVE_MAP" | jq -r 'to_entries[0].key')"
     X_ACTIVITY_BYTES="$(printf '%s' "$X_ACTIVE_MAP" | jq -r 'to_entries[0].value')"
     is_uint "$X_ACTIVITY_BYTES" || exit 0
-    # Heartbeat-level traffic from an idle app is not real usage.
-    [ "$X_ACTIVITY_BYTES" -ge "$X_MIN_ACTIVITY_BYTES" ] || exit 0
-
     # The sleep made the pre-sample NOW stale; refresh before backoff and marker.
     NOW="$(date +%s)"
     LAST_ATTEMPT=0
@@ -969,6 +977,23 @@ x_connection_ids()
 if ! new_challenges_enabled; then
     event challenge_cancelled '{"stage":"before_pending","cause":"disabled"}'
     exit 0
+fi
+
+# X preselection can take tens of seconds. If YouTube started meanwhile, do not
+# let the weaker X proxy metric change MEDIA underneath a real video session.
+if [ "$TRIGGER_KIND" = x ]; then
+    PRE_SWITCH_CONNECTIONS="$(api "$API_BASE/connections" 2>/dev/null)" || {
+        event challenge_cancelled '{"stage":"before_pending","cause":"connections_recheck_failed","trigger":"x"}'
+        exit 0
+    }
+    PRE_SWITCH_HAS_GOOGLEVIDEO="$(printf '%s' "$PRE_SWITCH_CONNECTIONS" | connections_have_googlevideo "$CURRENT_NODE" 2>/dev/null)" || {
+        event challenge_cancelled '{"stage":"before_pending","cause":"connections_recheck_parse_failed","trigger":"x"}'
+        exit 0
+    }
+    if [ "$PRE_SWITCH_HAS_GOOGLEVIDEO" = true ]; then
+        event x_probe_deferred '{"cause":"youtube_became_active","stage":"before_pending"}'
+        exit 0
+    fi
 fi
 
 CURRENT_BEFORE_SWITCH="$(selected_node "$MEDIA_GROUP")"

@@ -61,3 +61,6 @@
   single device. A prior version only checked that X connections existed, so an
   idle background X app could burn the hourly benchmark and two idle devices
   spammed `x_multi_device_deferred` every minute; both now stay silent.
+- V1.3.3 applies the activity byte threshold before counting source devices and
+  rechecks Googlevideo after X sampling and before pending, preserving YouTube
+  priority across the full X preselection interval.

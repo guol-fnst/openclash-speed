@@ -50,8 +50,8 @@ printf '%s' "$x_sample" | jq -e --arg group MEDIA --arg node node-a '
 # second snapshot contributes its full download, and an idle connection with a
 # zero delta from another source is dropped.
 x_old='{"cx1":{"download":1000,"source":"10.0.0.7"},"cx3":{"download":5000,"source":"10.0.0.9"}}'
-x_snapshot='{"connections":[{"id":"cx1","download":4000,"chains":["node-a","MEDIA"],"metadata":{"host":"api.x.com","sourceIP":"10.0.0.7"}},{"id":"cx2","download":2000,"chains":["node-a","MEDIA"],"metadata":{"host":"video.twimg.com","sourceIP":"10.0.0.7"}},{"id":"cx3","download":5000,"chains":["node-a","MEDIA"],"metadata":{"host":"x.com","sourceIP":"10.0.0.9"}}]}'
-printf '%s' "$x_snapshot" | jq -e --arg group MEDIA --arg node node-a --argjson old "$x_old" '
+x_snapshot='{"connections":[{"id":"cx1","download":4000,"chains":["node-a","MEDIA"],"metadata":{"host":"api.x.com","sourceIP":"10.0.0.7"}},{"id":"cx2","download":2000,"chains":["node-a","MEDIA"],"metadata":{"host":"video.twimg.com","sourceIP":"10.0.0.7"}},{"id":"cx3","download":5100,"chains":["node-a","MEDIA"],"metadata":{"host":"x.com","sourceIP":"10.0.0.9"}}]}'
+printf '%s' "$x_snapshot" | jq -e --arg group MEDIA --arg node node-a --argjson old "$x_old" --argjson min 4096 '
   def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
     ($h == "x.com" or ($h | endswith(".x.com")) or
      $h == "twitter.com" or ($h | endswith(".twitter.com")) or
@@ -63,7 +63,8 @@ printf '%s' "$x_snapshot" | jq -e --arg group MEDIA --arg node node-a --argjson 
      delta:(if $p==null then ($x.download // 0) else (($x.download // 0)-($p.download // 0)) end)}]
   | [.[] | select(.delta>0 and (.source|length>0))] as $active
   | ([$active[].source] | unique) as $sources
-  | ([$sources[] as $s | {key:$s,value:([$active[] | select(.source==$s) | .delta] | add)}] | from_entries)
+  | ([$sources[] as $s | {key:$s,value:([$active[] | select(.source==$s) | .delta] | add)}]
+     | from_entries | with_entries(select(.value >= $min)))
   | . == {"10.0.0.7":5000}
 ' >/dev/null
 
