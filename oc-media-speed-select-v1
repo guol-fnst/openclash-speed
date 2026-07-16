@@ -24,6 +24,7 @@ CONFIG="${CONFIG:-/etc/openclash/speed-select/config}"
 : "${CHAIN_VERIFY_RATE_BYTES_PER_SEC:=65536}"
 : "${X_TRIGGER_ENABLED:=1}"
 : "${X_PROBE_COOLDOWN_SECONDS:=3600}"
+: "${X_PROBE_FAILURE_BACKOFF_SECONDS:=300}"
 : "${YOUTUBE_TARGET_BYTES_PER_SEC:=1000000}"
 : "${LOW_WINDOW_SECONDS:=8}"
 : "${LOW_REQUIRED_WINDOWS:=3}"
@@ -62,6 +63,7 @@ PENALTY_FILE="$PERSIST_DIR/node_penalties.json"
 INCONCLUSIVE_FILE="$PERSIST_DIR/inconclusive_counts.json"
 LAST_ATTEMPT_FILE="$PERSIST_DIR/last_challenge_attempt"
 LAST_X_PROBE_FILE="$PERSIST_DIR/last_x_probe"
+LAST_X_PROBE_FAILURE_FILE="$PERSIST_DIR/last_x_probe_failure"
 LOW_STREAK_FILE="$VOLATILE_DIR/low_streak.json"
 STALL_STREAK_FILE="$VOLATILE_DIR/stall_streak.json"
 RUN_ID="$(date +%s)-$$"
@@ -76,6 +78,7 @@ for value in "$BENCH_PROXY_PORT" "$MAX_DELAY_MS" "$MAX_CHALLENGERS" \
     "$BENCH_TEST_SECONDS" "$BENCH_MAX_BYTES" "$BENCH_MIN_VALID_BYTES" \
     "$CHAIN_VERIFY_SECONDS" "$CHAIN_VERIFY_RATE_BYTES_PER_SEC" \
     "$X_TRIGGER_ENABLED" "$X_PROBE_COOLDOWN_SECONDS" \
+    "$X_PROBE_FAILURE_BACKOFF_SECONDS" \
     "$YOUTUBE_TARGET_BYTES_PER_SEC" "$LOW_WINDOW_SECONDS" \
     "$LOW_REQUIRED_WINDOWS" "$LOW_MIN_ACTIVE_SECONDS" "$LOW_MIN_BYTES" \
     "$LOW_STREAK_MAX_GAP_SECONDS" "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" \
@@ -117,6 +120,14 @@ atomic_write()
 durable_write()
 {
     atomic_write "$1" "$2" || return 1
+    sync
+}
+
+complete_x_probe()
+{
+    completed_at="$(date +%s)"
+    durable_write "$LAST_X_PROBE_FILE" "$completed_at" || return 1
+    rm -f "$LAST_X_PROBE_FAILURE_FILE"
     sync
 }
 
@@ -520,6 +531,11 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
     is_uint "$LAST_X_PROBE" || LAST_X_PROBE=0
     [ $((NOW - LAST_X_PROBE)) -ge "$X_PROBE_COOLDOWN_SECONDS" ] || exit 0
 
+    LAST_X_PROBE_FAILURE=0
+    [ -r "$LAST_X_PROBE_FAILURE_FILE" ] && LAST_X_PROBE_FAILURE="$(cat "$LAST_X_PROBE_FAILURE_FILE" 2>/dev/null)"
+    is_uint "$LAST_X_PROBE_FAILURE" || LAST_X_PROBE_FAILURE=0
+    [ $((NOW - LAST_X_PROBE_FAILURE)) -ge "$X_PROBE_FAILURE_BACKOFF_SECONDS" ] || exit 0
+
     LAST_ATTEMPT=0
     [ -r "$LAST_ATTEMPT_FILE" ] && LAST_ATTEMPT="$(cat "$LAST_ATTEMPT_FILE" 2>/dev/null)"
     is_uint "$LAST_ATTEMPT" || LAST_ATTEMPT=0
@@ -530,9 +546,12 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
 
     TRIGGER_KIND=x
     TRIGGER_SOURCE="$(printf '%s' "$X_SOURCE_IPS" | jq -r '.[0]')"
-    durable_write "$LAST_X_PROBE_FILE" "$NOW" || exit 1
-    durable_write "$LAST_ATTEMPT_FILE" "$NOW" || exit 1
-    event x_access_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson cooldown "$X_PROBE_COOLDOWN_SECONDS" '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,benchmark:"dl.google.com"}')"
+    # Start with a short failure marker. Only a valid current-vs-candidate
+    # comparison promotes this run to the normal one-hour completion cooldown.
+    durable_write "$LAST_X_PROBE_FAILURE_FILE" "$NOW" || exit 1
+    event x_access_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" \
+        --argjson cooldown "$X_PROBE_COOLDOWN_SECONDS" --argjson failure_backoff "$X_PROBE_FAILURE_BACKOFF_SECONDS" \
+        '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,failure_backoff_seconds:$failure_backoff,benchmark:"dl.google.com"}')"
 fi
 
 if [ "$TRIGGER_KIND" = youtube ]; then
@@ -832,7 +851,13 @@ while IFS= read -r node; do
     [ -n "$node" ] || continue
     delay="$(printf '%s' "$DELAY_JSON" | jq -r --arg node "$node" '.[$node] // 99999')"
     sequence=$((sequence + 1))
-    benchmark_node "$node" "$delay" "$sequence"
+    if ! benchmark_node "$node" "$delay" "$sequence"; then
+        if [ "$TRIGGER_KIND" = x ] && [ "$node" = "$CURRENT_NODE" ]; then
+            event x_current_benchmark_retry "$(jq -nc --arg node "$node" '{node:$node,attempt:2}')"
+            sequence=$((sequence + 1))
+            benchmark_node "$node" "$delay" "$sequence" || true
+        fi
+    fi
 done < "$CANDIDATES"
 
 CHALLENGER="$(awk -F '\t' -v current="$CURRENT_NODE" '$1!=current {if(!found || $2>best){found=1;best=$2;node=$1}} END{print node}' "$RUN_DIR/results")"
@@ -845,7 +870,12 @@ CHALLENGER_BPS="$(awk -F '\t' -v node="$CHALLENGER" '$1==node {print $2;exit}' "
 if [ "$TRIGGER_KIND" = x ]; then
     CURRENT_BENCH_BPS="$(awk -F '\t' -v node="$CURRENT_NODE" '$1==node {print $2;exit}' "$RUN_DIR/results")"
     if ! is_uint "$CURRENT_BENCH_BPS" || [ "$CURRENT_BENCH_BPS" -le 0 ]; then
-        event x_probe_error '{"stage":"download_test","cause":"current_node_has_no_valid_result"}'
+        event x_probe_error "$(jq -nc --argjson retry_after "$((NOW + X_PROBE_FAILURE_BACKOFF_SECONDS))" \
+            '{stage:"download_test",cause:"current_node_has_no_valid_result",retry_after:$retry_after}')"
+        exit 0
+    fi
+    if ! complete_x_probe; then
+        event x_probe_error '{"stage":"cooldown_commit","cause":"state_write_failed"}'
         exit 0
     fi
     X_RATIO_REQUIRED=$((CURRENT_BENCH_BPS * KEEP_RATIO_PERCENT / 100))
@@ -858,6 +888,8 @@ if [ "$TRIGGER_KIND" = x ]; then
             '{current_node:$current,best_candidate:$best,current_bytes_per_second:$current_bps,candidate_bytes_per_second:$best_bps,ratio_required:$ratio_required,delta_required:$delta_required}')"
         exit 0
     fi
+    # A real selector change also participates in the shared challenge backoff.
+    durable_write "$LAST_ATTEMPT_FILE" "$(date +%s)" || exit 1
 fi
 
 googlevideo_connection_ids()

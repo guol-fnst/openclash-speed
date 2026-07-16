@@ -6,4 +6,5 @@ node_penalties.json
 inconclusive_counts.json
 last_challenge_attempt
 last_x_probe
+last_x_probe_failure
 backups/

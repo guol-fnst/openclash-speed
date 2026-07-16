@@ -25,6 +25,8 @@ x_trigger="$(sed -n 's/^X_TRIGGER_ENABLED=//p' "$CONFIG")"
 [ "$x_trigger" = 1 ]
 x_cooldown="$(sed -n 's/^X_PROBE_COOLDOWN_SECONDS=//p' "$CONFIG")"
 [ "$x_cooldown" = 3600 ]
+x_failure_backoff="$(sed -n 's/^X_PROBE_FAILURE_BACKOFF_SECONDS=//p' "$CONFIG")"
+[ "$x_failure_backoff" = 300 ]
 stall_enabled="$(sed -n 's/^STALL_PROBE_ENABLED=//p' "$CONFIG")"
 [ "$stall_enabled" = 1 ]
 inconclusive_count="$(sed -n 's/^INCONCLUSIVE_REQUIRED_COUNT=//p' "$CONFIG")"
@@ -88,6 +90,7 @@ if x_switch 1000000 1199999 || x_switch 1000000 1125000; then
 fi
 
 grep -F 'event x_access_trigger' "$SCRIPT" >/dev/null
+grep -F 'event x_current_benchmark_retry' "$SCRIPT" >/dev/null
 grep -F 'event x_challenge_success' "$SCRIPT" >/dev/null
 
 # The Ruby portion is exercised when Ruby is available (on the router it is).
