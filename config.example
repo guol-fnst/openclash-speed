@@ -1,0 +1,66 @@
+# Safe default: pending recovery may run, but no new challenge is started.
+ENABLED=0
+
+# Mihomo/OpenClash objects created by oc_media_patch_v1.rb.
+MEDIA_GROUP=MEDIA
+BENCH_GROUP=BENCH
+BENCH_PROXY_PORT=7898
+
+# Google-network preselection. This is not the final YouTube verdict.
+BENCH_URL='https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi'
+BENCH_HOST='dl.google.com'
+DELAY_TEST_URL='https://www.gstatic.com/generate_204'
+MAX_DELAY_MS=800
+MAX_CHALLENGERS=3
+BENCH_TEST_SECONDS=4
+BENCH_MAX_BYTES=12582912
+BENCH_MIN_VALID_BYTES=262144
+CHAIN_VERIFY_SECONDS=3
+CHAIN_VERIFY_RATE_BYTES_PER_SEC=65536
+
+# Passive YouTube measurement. All rates are BYTES per second.
+# 1,000,000 bytes/s is approximately 8 Mbps and leaves margin for 1080p.
+YOUTUBE_TARGET_BYTES_PER_SEC=1000000
+LOW_WINDOW_SECONDS=8
+LOW_REQUIRED_WINDOWS=3
+LOW_MIN_ACTIVE_SECONDS=2
+LOW_MIN_BYTES=262144
+LOW_STREAK_MAX_GAP_SECONDS=180
+# A large burst is positive evidence even when it finishes before the normal
+# slow-evidence minima. Challenge rollback remains more conservative below.
+FAST_POSITIVE_MIN_ACTIVE_SECONDS=1
+FAST_POSITIVE_MIN_BYTES=4194304
+OBSERVE_SECONDS=30
+OBSERVE_MIN_ACTIVE_SECONDS=4
+OBSERVE_MIN_BYTES=1048576
+
+# V1.1 diagnostic-only stall probe. It records stall_suspected after three
+# consecutive request/churn windows with almost no delivery. It never switches.
+STALL_PROBE_ENABLED=1
+STALL_REQUIRED_WINDOWS=3
+STALL_MIN_NEW_CONNECTIONS=1
+STALL_MIN_UPLOAD_BYTES=1
+STALL_MAX_BYTES=131072
+STALL_MAX_GAP_SECONDS=180
+
+# Challenger verdict.
+KEEP_RATIO_PERCENT=120
+KEEP_MIN_DELTA_BYTES_PER_SEC=125000
+
+# Scheduling and penalties.
+CHALLENGE_BACKOFF_SECONDS=600
+FAILED_BLACKLIST_SECONDS=21600
+INCONCLUSIVE_RETRY_SECONDS=3600
+INCONCLUSIVE_REQUIRED_COUNT=2
+INCONCLUSIVE_COUNT_MAX_GAP_SECONDS=21600
+PENDING_TIMEOUT_SECONDS=120
+
+# When enabled, only pre-switch googlevideo connection IDs from the triggering
+# source IP are closed. The player is expected to reconnect through new_node.
+KILL_OLD_CONNECTIONS=1
+
+# Persistent and volatile paths.
+PERSIST_DIR='/etc/openclash/speed-select'
+VOLATILE_DIR='/tmp/oc-media-speed-select-v1'
+EVENT_LOG='/etc/openclash/speed-select/events.jsonl'
+LOG_MAX_BYTES=1048576

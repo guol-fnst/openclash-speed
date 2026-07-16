@@ -1,0 +1,10 @@
+# Keep MEDIA/BENCH, bench-in:7898 and routing rules after subscription updates.
+# Add this immediately before the final `exit 0` in:
+# /etc/openclash/custom/openclash_custom_overwrite.sh
+OC_MEDIA_CONFIG='/etc/openclash/speed-select/config'
+BENCH_PROXY_PORT=7898
+if [ -r "$OC_MEDIA_CONFIG" ]; then
+    configured_port="$(sed -n 's/^[[:space:]]*BENCH_PROXY_PORT=\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$OC_MEDIA_CONFIG" | tail -n 1)"
+    [ -n "$configured_port" ] && BENCH_PROXY_PORT="$configured_port"
+fi
+ruby /etc/openclash/custom/oc_media_patch_v1.rb "$CONFIG_FILE" "$BENCH_PROXY_PORT" >> "$LOG_FILE" 2>&1

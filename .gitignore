@@ -1,0 +1,9 @@
+# Router-specific runtime/deployment state must never enter the public repo.
+config.router*
+events.jsonl*
+challenge_pending*
+node_penalties.json
+inconclusive_counts.json
+last_challenge_attempt
+backups/
+

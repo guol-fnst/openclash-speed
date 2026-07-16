@@ -1,0 +1,937 @@
+#!/bin/sh
+
+# YouTube-aware OpenClash MEDIA selector, review build.
+# POSIX/BusyBox ash compatible. No action is started when ENABLED=0, but an
+# existing challenge_pending transaction is still recovered.
+
+CONFIG="${CONFIG:-/etc/openclash/speed-select/config}"
+[ -r "$CONFIG" ] || exit 1
+. "$CONFIG"
+
+: "${ENABLED:=0}"
+: "${MEDIA_GROUP:=MEDIA}"
+: "${BENCH_GROUP:=BENCH}"
+: "${BENCH_PROXY_PORT:=7898}"
+: "${BENCH_URL:=https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi}"
+: "${BENCH_HOST:=dl.google.com}"
+: "${DELAY_TEST_URL:=https://www.gstatic.com/generate_204}"
+: "${MAX_DELAY_MS:=800}"
+: "${MAX_CHALLENGERS:=3}"
+: "${BENCH_TEST_SECONDS:=4}"
+: "${BENCH_MAX_BYTES:=12582912}"
+: "${BENCH_MIN_VALID_BYTES:=262144}"
+: "${CHAIN_VERIFY_SECONDS:=3}"
+: "${CHAIN_VERIFY_RATE_BYTES_PER_SEC:=65536}"
+: "${YOUTUBE_TARGET_BYTES_PER_SEC:=1000000}"
+: "${LOW_WINDOW_SECONDS:=8}"
+: "${LOW_REQUIRED_WINDOWS:=3}"
+: "${LOW_MIN_ACTIVE_SECONDS:=2}"
+: "${LOW_MIN_BYTES:=262144}"
+: "${LOW_STREAK_MAX_GAP_SECONDS:=180}"
+: "${FAST_POSITIVE_MIN_ACTIVE_SECONDS:=1}"
+: "${FAST_POSITIVE_MIN_BYTES:=4194304}"
+: "${OBSERVE_SECONDS:=30}"
+: "${OBSERVE_MIN_ACTIVE_SECONDS:=4}"
+: "${OBSERVE_MIN_BYTES:=1048576}"
+: "${STALL_PROBE_ENABLED:=1}"
+: "${STALL_REQUIRED_WINDOWS:=3}"
+: "${STALL_MIN_NEW_CONNECTIONS:=1}"
+: "${STALL_MIN_UPLOAD_BYTES:=1}"
+: "${STALL_MAX_BYTES:=131072}"
+: "${STALL_MAX_GAP_SECONDS:=180}"
+: "${KEEP_RATIO_PERCENT:=120}"
+: "${KEEP_MIN_DELTA_BYTES_PER_SEC:=125000}"
+: "${CHALLENGE_BACKOFF_SECONDS:=600}"
+: "${FAILED_BLACKLIST_SECONDS:=21600}"
+: "${INCONCLUSIVE_RETRY_SECONDS:=3600}"
+: "${INCONCLUSIVE_REQUIRED_COUNT:=2}"
+: "${INCONCLUSIVE_COUNT_MAX_GAP_SECONDS:=21600}"
+: "${PENDING_TIMEOUT_SECONDS:=120}"
+: "${KILL_OLD_CONNECTIONS:=1}"
+: "${PERSIST_DIR:=/etc/openclash/speed-select}"
+: "${VOLATILE_DIR:=/tmp/oc-media-speed-select-v1}"
+: "${EVENT_LOG:=$PERSIST_DIR/events.jsonl}"
+: "${LOG_MAX_BYTES:=1048576}"
+
+LOG_TAG='oc-media-v1'
+LOCK_FILE='/tmp/oc-media-speed-select-v1.lock'
+PENDING_FILE="$PERSIST_DIR/challenge_pending"
+PENALTY_FILE="$PERSIST_DIR/node_penalties.json"
+INCONCLUSIVE_FILE="$PERSIST_DIR/inconclusive_counts.json"
+LAST_ATTEMPT_FILE="$PERSIST_DIR/last_challenge_attempt"
+LOW_STREAK_FILE="$VOLATILE_DIR/low_streak.json"
+STALL_STREAK_FILE="$VOLATILE_DIR/stall_streak.json"
+RUN_ID="$(date +%s)-$$"
+RUN_DIR="$VOLATILE_DIR/run.$$"
+
+is_uint()
+{
+    case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+for value in "$BENCH_PROXY_PORT" "$MAX_DELAY_MS" "$MAX_CHALLENGERS" \
+    "$BENCH_TEST_SECONDS" "$BENCH_MAX_BYTES" "$BENCH_MIN_VALID_BYTES" \
+    "$CHAIN_VERIFY_SECONDS" "$CHAIN_VERIFY_RATE_BYTES_PER_SEC" \
+    "$YOUTUBE_TARGET_BYTES_PER_SEC" "$LOW_WINDOW_SECONDS" \
+    "$LOW_REQUIRED_WINDOWS" "$LOW_MIN_ACTIVE_SECONDS" "$LOW_MIN_BYTES" \
+    "$LOW_STREAK_MAX_GAP_SECONDS" "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" \
+    "$FAST_POSITIVE_MIN_BYTES" "$OBSERVE_SECONDS" \
+    "$OBSERVE_MIN_ACTIVE_SECONDS" "$OBSERVE_MIN_BYTES" \
+    "$STALL_PROBE_ENABLED" "$STALL_REQUIRED_WINDOWS" \
+    "$STALL_MIN_NEW_CONNECTIONS" "$STALL_MIN_UPLOAD_BYTES" \
+    "$STALL_MAX_BYTES" "$STALL_MAX_GAP_SECONDS" \
+    "$KEEP_RATIO_PERCENT" "$KEEP_MIN_DELTA_BYTES_PER_SEC" \
+    "$CHALLENGE_BACKOFF_SECONDS" "$FAILED_BLACKLIST_SECONDS" \
+    "$INCONCLUSIVE_RETRY_SECONDS" "$INCONCLUSIVE_REQUIRED_COUNT" \
+    "$INCONCLUSIVE_COUNT_MAX_GAP_SECONDS" "$PENDING_TIMEOUT_SECONDS" "$LOG_MAX_BYTES"
+do
+    is_uint "$value" || exit 1
+done
+
+umask 077
+mkdir -p "$PERSIST_DIR" "$VOLATILE_DIR" "$RUN_DIR" || exit 1
+
+# Real kernel-backed flock: no stale mkdir lock after SIGKILL.
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
+
+cleanup()
+{
+    rm -rf "$RUN_DIR"
+}
+trap cleanup EXIT INT TERM
+
+atomic_write()
+{
+    target="$1"
+    content="$2"
+    tmp="${target}.tmp.$$"
+    printf '%s\n' "$content" > "$tmp" || return 1
+    mv -f "$tmp" "$target"
+}
+
+durable_write()
+{
+    atomic_write "$1" "$2" || return 1
+    sync
+}
+
+rotate_log()
+{
+    [ -f "$EVENT_LOG" ] || return 0
+    size="$(wc -c < "$EVENT_LOG" 2>/dev/null)"
+    is_uint "$size" || size=0
+    if [ "$size" -ge "$LOG_MAX_BYTES" ]; then
+        mv -f "$EVENT_LOG" "$EVENT_LOG.1"
+    fi
+}
+
+event()
+{
+    event_name="$1"
+    if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+        detail_json="$2"
+    else
+        detail_json='{}'
+    fi
+    rotate_log
+    line="$(jq -nc \
+        --arg ts "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+        --argjson epoch "$(date +%s)" \
+        --arg run_id "$RUN_ID" \
+        --arg event "$event_name" \
+        --argjson detail "$detail_json" \
+        '{ts:$ts,epoch:$epoch,run_id:$run_id,event:$event}+$detail' 2>/dev/null)" || return 1
+    printf '%s\n' "$line" >> "$EVENT_LOG"
+    logger -t "$LOG_TAG" "$event_name $detail_json"
+}
+
+runtime_config()
+{
+    source_path="$(uci -q get openclash.config.config_path)"
+    base_name="${source_path##*/}"
+    if [ -n "$base_name" ] && [ -r "/etc/openclash/$base_name" ]; then
+        printf '%s\n' "/etc/openclash/$base_name"
+    elif [ -r "$source_path" ]; then
+        printf '%s\n' "$source_path"
+    fi
+}
+
+RUNTIME_CONFIG="$(runtime_config)"
+[ -n "$RUNTIME_CONFIG" ] || exit 0
+
+read_yaml_value()
+{
+    ruby -ryaml -e 'v=YAML.load_file(ARGV[0])||{}; x=v[ARGV[1]]; print(x.nil? ? "" : x)' \
+        "$RUNTIME_CONFIG" "$1" 2>/dev/null
+}
+
+CONTROLLER="$(read_yaml_value external-controller)"
+CONTROLLER_PORT="${CONTROLLER##*:}"
+is_uint "$CONTROLLER_PORT" || CONTROLLER_PORT=9090
+API_BASE="http://127.0.0.1:$CONTROLLER_PORT"
+API_SECRET="$(read_yaml_value secret)"
+
+api()
+{
+    if [ -n "$API_SECRET" ]; then
+        curl -fsS --connect-timeout 4 -H "Authorization: Bearer $API_SECRET" "$@"
+    else
+        curl -fsS --connect-timeout 4 "$@"
+    fi
+}
+
+selected_node()
+{
+    api "$API_BASE/proxies/$1" 2>/dev/null | jq -r '.now // empty' 2>/dev/null
+}
+
+group_has_node()
+{
+    api "$API_BASE/proxies/$1" 2>/dev/null |
+        jq -e --arg node "$2" '((.all // []) | index($node)) != null' >/dev/null 2>&1
+}
+
+put_selection()
+{
+    payload="$(jq -nc --arg name "$2" '{name:$name}')"
+    api -X PUT -H 'Content-Type: application/json' -d "$payload" \
+        "$API_BASE/proxies/$1" >/dev/null 2>&1
+}
+
+verify_selection()
+{
+    group="$1"
+    expected="$2"
+    tries=0
+    while [ "$tries" -lt 3 ]; do
+        actual="$(selected_node "$group")"
+        [ "$actual" = "$expected" ] && return 0
+        tries=$((tries + 1))
+        sleep 1
+    done
+    return 1
+}
+
+clear_pending()
+{
+    rm -f "$PENDING_FILE"
+    sync
+}
+
+write_pending()
+{
+    pending_json="$(jq -nc \
+        --arg run_id "$RUN_ID" \
+        --arg old_node "$1" \
+        --arg new_node "$2" \
+        --arg source_ip "$3" \
+        --argjson started_at "$(date +%s)" \
+        '{version:1,run_id:$run_id,old_node:$old_node,new_node:$new_node,source_ip:$source_ip,started_at:$started_at}')"
+    durable_write "$PENDING_FILE" "$pending_json"
+}
+
+# Roll back only while MEDIA is still owned by this transaction. A third node
+# always wins because it represents a user or another controller intervening.
+rollback_owned_transaction()
+{
+    old_node="$1"
+    new_node="$2"
+    reason="$3"
+    current="$(selected_node "$MEDIA_GROUP")"
+    if [ -z "$current" ]; then
+        event rollback_deferred "$(jq -nc --arg reason "$reason" '{reason:$reason,cause:"media_read_failed"}')"
+        return 1
+    fi
+
+    if [ "$current" = "$old_node" ]; then
+        clear_pending
+        event rollback_already_applied "$(jq -nc --arg old "$old_node" --arg reason "$reason" '{old_node:$old,reason:$reason}')"
+        return 0
+    fi
+
+    if [ "$current" != "$new_node" ]; then
+        clear_pending
+        event selector_changed_externally "$(jq -nc --arg old "$old_node" --arg new "$new_node" --arg current "$current" --arg reason "$reason" '{old_node:$old,new_node:$new,current_node:$current,reason:$reason}')"
+        return 0
+    fi
+
+    if ! group_has_node "$MEDIA_GROUP" "$old_node"; then
+        clear_pending
+        event rollback_unavailable "$(jq -nc --arg old "$old_node" --arg new "$new_node" --arg reason "$reason" '{old_node:$old,new_node:$new,reason:$reason,cause:"old_node_missing"}')"
+        return 0
+    fi
+
+    if put_selection "$MEDIA_GROUP" "$old_node" && verify_selection "$MEDIA_GROUP" "$old_node"; then
+        clear_pending
+        event challenge_rollback "$(jq -nc --arg old "$old_node" --arg new "$new_node" --arg reason "$reason" '{old_node:$old,new_node:$new,reason:$reason}')"
+        return 0
+    fi
+
+    event rollback_deferred "$(jq -nc --arg old "$old_node" --arg new "$new_node" --arg reason "$reason" '{old_node:$old,new_node:$new,reason:$reason,cause:"write_or_verify_failed"}')"
+    return 1
+}
+
+recover_pending()
+{
+    [ -f "$PENDING_FILE" ] || return 0
+    if ! jq -e '.version==1 and (.old_node|type)=="string" and (.new_node|type)=="string" and (.started_at|type)=="number" and .started_at>=0 and (.started_at|floor)==.started_at' \
+        "$PENDING_FILE" >/dev/null 2>&1; then
+        corrupt="$PENDING_FILE.corrupt.$(date +%s)"
+        mv -f "$PENDING_FILE" "$corrupt"
+        event pending_corrupt "$(jq -nc --arg path "$corrupt" '{path:$path}')"
+        return 0
+    fi
+
+    pending_run_id="$(jq -r '.run_id // "unknown"' "$PENDING_FILE")"
+    old_node="$(jq -r '.old_node' "$PENDING_FILE")"
+    new_node="$(jq -r '.new_node' "$PENDING_FILE")"
+    started_at="$(jq -r '.started_at' "$PENDING_FILE")"
+    now="$(date +%s)"
+    age=$((now - started_at))
+    # A backwards wall-clock jump after reboot also proves the creating process
+    # is gone, so recover immediately instead of waiting for the clock to catch up.
+    [ "$age" -lt 0 ] && age="$PENDING_TIMEOUT_SECONDS"
+    if [ "$age" -lt "$PENDING_TIMEOUT_SECONDS" ]; then
+        event pending_wait "$(jq -nc --arg pending_run_id "$pending_run_id" --argjson age "$age" '{pending_run_id:$pending_run_id,age_sec:$age}')"
+        return 2
+    fi
+
+    event pending_recovery_start "$(jq -nc --arg pending_run_id "$pending_run_id" --arg old "$old_node" --arg new "$new_node" --argjson age "$age" '{pending_run_id:$pending_run_id,old_node:$old,new_node:$new,age_sec:$age}')"
+    rollback_owned_transaction "$old_node" "$new_node" pending_timeout
+}
+
+# Recovery precedes ENABLED by design. OpenClash being down simply leaves the
+# durable pending file for the next cron invocation.
+if ! api "$API_BASE/version" >/dev/null 2>&1; then
+    exit 0
+fi
+if [ -f "$PENDING_FILE" ]; then
+    recover_pending
+    exit 0
+fi
+[ "$ENABLED" = 1 ] || exit 0
+
+new_challenges_enabled()
+{
+    (
+        ENABLED=0
+        . "$CONFIG"
+        [ "$ENABLED" = 1 ]
+    )
+}
+
+# Return delivery counters plus conservative connection-churn diagnostics.
+# Connections already present at the first snapshot are baselined. A connection
+# first seen later is known to have appeared inside the window, so its current
+# counters can safely be attributed to this window.
+sample_googlevideo()
+{
+    seconds="$1"
+    node="$2"
+    output_file="$3"
+    previous='{}'
+    total_bytes=0
+    total_upload_bytes=0
+    active_seconds=0
+    source_ips='[]'
+    activity_source_ips='[]'
+    new_connection_ids='[]'
+    iteration=0
+
+    first="$(api "$API_BASE/connections" 2>/dev/null)" || return 1
+    previous="$(printf '%s' "$first" | jq -c \
+        --arg group "$MEDIA_GROUP" --arg node "$node" '
+        def gv: (.metadata.host // "" | ascii_downcase) as $h |
+          ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
+        [.connections[]? | select(gv) |
+          select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+          {key:.id,value:{download:(.download // 0),upload:(.upload // 0),source:(.metadata.sourceIP // "")}}] | from_entries' 2>/dev/null)" || return 1
+
+    while [ "$iteration" -lt "$seconds" ]; do
+        sleep 1
+        snapshot="$(api "$API_BASE/connections" 2>/dev/null)" || return 1
+        step="$(printf '%s' "$snapshot" | jq -c \
+            --arg group "$MEDIA_GROUP" --arg node "$node" --argjson old "$previous" '
+            def gv: (.metadata.host // "" | ascii_downcase) as $h |
+              ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
+            [.connections[]? | select(gv) |
+              select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null))] as $c |
+            [$c[] | . as $x | ($old[$x.id] // null) as $p |
+              {id:$x.id,source:($x.metadata.sourceIP // ""),is_new:($p==null),
+               download_delta:(if $p==null then ($x.download // 0) else (($x.download // 0)-($p.download // 0)) end),
+               upload_delta:(if $p==null then ($x.upload // 0) else (($x.upload // 0)-($p.upload // 0)) end)}] as $d |
+            {map:($c | map({key:.id,value:{download:(.download // 0),upload:(.upload // 0),source:(.metadata.sourceIP // "")}}) | from_entries),
+             bytes:([$d[].download_delta | select(.>0)] | add // 0),
+             upload_bytes:([$d[].upload_delta | select(.>0)] | add // 0),
+             new_ids:([$d[] | select(.is_new) | .id] | unique),
+             source_ips:([$d[] | select(.download_delta>0) | .source | select(length>0)] | unique),
+             activity_source_ips:([$d[] | select(.is_new or .download_delta>0 or .upload_delta>0) | .source | select(length>0)] | unique)}' 2>/dev/null)" || return 1
+
+        step_bytes="$(printf '%s' "$step" | jq -r '.bytes')"
+        is_uint "$step_bytes" || step_bytes=0
+        if [ "$step_bytes" -gt 0 ]; then
+            active_seconds=$((active_seconds + 1))
+            total_bytes=$((total_bytes + step_bytes))
+        fi
+        step_upload_bytes="$(printf '%s' "$step" | jq -r '.upload_bytes')"
+        is_uint "$step_upload_bytes" || step_upload_bytes=0
+        total_upload_bytes=$((total_upload_bytes + step_upload_bytes))
+        step_sources="$(printf '%s' "$step" | jq -c '.source_ips')"
+        source_ips="$(jq -nc --argjson old "$source_ips" --argjson new "$step_sources" '$old+$new|unique')"
+        step_activity_sources="$(printf '%s' "$step" | jq -c '.activity_source_ips')"
+        activity_source_ips="$(jq -nc --argjson old "$activity_source_ips" --argjson new "$step_activity_sources" '$old+$new|unique')"
+        step_new_ids="$(printf '%s' "$step" | jq -c '.new_ids')"
+        new_connection_ids="$(jq -nc --argjson old "$new_connection_ids" --argjson new "$step_new_ids" '$old+$new|unique')"
+        previous="$(printf '%s' "$step" | jq -c '.map')"
+        iteration=$((iteration + 1))
+    done
+
+    if [ "$active_seconds" -gt 0 ]; then
+        bps=$((total_bytes / active_seconds))
+    else
+        bps=0
+    fi
+    new_connection_count="$(printf '%s' "$new_connection_ids" | jq -r 'length')"
+    result="$(jq -nc --arg node "$node" --argjson bytes "$total_bytes" \
+        --argjson upload_bytes "$total_upload_bytes" \
+        --argjson active "$active_seconds" --argjson seconds "$seconds" \
+        --argjson bps "$bps" --argjson sources "$source_ips" \
+        --argjson activity_sources "$activity_source_ips" \
+        --argjson new_count "$new_connection_count" \
+        '{node:$node,total_bytes:$bytes,upload_bytes:$upload_bytes,active_seconds:$active,window_seconds:$seconds,bytes_per_active_second:$bps,source_ips:$sources,activity_source_ips:$activity_sources,new_connection_count:$new_count}')"
+    atomic_write "$output_file" "$result"
+}
+
+# V1.1 probe only: identify repeated request/connection churn with almost no
+# delivery. It never benchmarks, switches, kills connections, or penalizes a
+# node. The event log is the sole output until its false-positive rate is known.
+update_stall_probe()
+{
+    STALL_MATCH=0
+    STALL_STREAK_COUNT=0
+    STALL_SUSPECTED_NEW=0
+    [ "$STALL_PROBE_ENABLED" = 1 ] || {
+        rm -f "$STALL_STREAK_FILE"
+        return 0
+    }
+
+    activity_count="$(printf '%s' "$PASSIVE_JSON" | jq -r '.activity_source_ips|length')"
+    new_count="$(printf '%s' "$PASSIVE_JSON" | jq -r '.new_connection_count')"
+    upload_bytes="$(printf '%s' "$PASSIVE_JSON" | jq -r '.upload_bytes')"
+    now="$(date +%s)"
+
+    # Any meaningful delivery breaks a stall sequence immediately.
+    if [ "$PASSIVE_BYTES" -ge "$LOW_MIN_BYTES" ] || \
+       { [ "$PASSIVE_ACTIVE" -gt 0 ] && [ "$PASSIVE_BPS" -ge "$YOUTUBE_TARGET_BYTES_PER_SEC" ]; }; then
+        rm -f "$STALL_STREAK_FILE"
+        return 0
+    fi
+
+    if [ "$activity_count" -ne 1 ] || \
+       [ "$new_count" -lt "$STALL_MIN_NEW_CONNECTIONS" ] || \
+       [ "$upload_bytes" -lt "$STALL_MIN_UPLOAD_BYTES" ] || \
+       [ "$PASSIVE_BYTES" -ge "$STALL_MAX_BYTES" ]; then
+        rm -f "$STALL_STREAK_FILE"
+        return 0
+    fi
+
+    STALL_MATCH=1
+    source="$(printf '%s' "$PASSIVE_JSON" | jq -r '.activity_source_ips[0]')"
+    old=''
+    [ -r "$STALL_STREAK_FILE" ] && old="$(cat "$STALL_STREAK_FILE" 2>/dev/null)"
+    # The compact jq shipped by some OpenWrt builds returns success for
+    # `jq -e` with empty stdin.  Check for content first or a missing state is
+    # mistaken for a state that can be updated, producing an empty streak.
+    if [ -n "$old" ] && printf '%s' "$old" | jq -e --arg node "$CURRENT_NODE" --arg source "$source" \
+        --argjson now "$now" --argjson gap "$STALL_MAX_GAP_SECONDS" \
+        '.node==$node and .source_ip==$source and (($now-.last_epoch)<= $gap)' >/dev/null 2>&1; then
+        state="$(printf '%s' "$old" | jq -c --argjson now "$now" '.count+=1 | .last_epoch=$now')"
+    else
+        state="$(jq -nc --arg node "$CURRENT_NODE" --arg source "$source" --argjson now "$now" \
+            '{node:$node,source_ip:$source,count:1,last_epoch:$now,reported:false}')"
+    fi
+    printf '%s' "$state" | jq -e 'type=="object" and (.count|type)=="number"' >/dev/null 2>&1 || return 1
+    atomic_write "$STALL_STREAK_FILE" "$state" || return 1
+    STALL_STREAK_COUNT="$(printf '%s' "$state" | jq -r '.count')"
+    reported="$(printf '%s' "$state" | jq -r '.reported')"
+    if [ "$STALL_STREAK_COUNT" -ge "$STALL_REQUIRED_WINDOWS" ] && [ "$reported" != true ]; then
+        state="$(printf '%s' "$state" | jq -c '.reported=true')"
+        atomic_write "$STALL_STREAK_FILE" "$state" || return 1
+        STALL_SUSPECTED_NEW=1
+    fi
+}
+
+log_passive_window()
+{
+    name="$1"
+    status="$2"
+    detail="$(printf '%s' "$PASSIVE_JSON" | jq -c \
+        --arg status "$status" --argjson stall_match "$STALL_MATCH" \
+        --argjson stall_streak "$STALL_STREAK_COUNT" \
+        '.+{status:$status,stall_window:($stall_match==1),stall_streak:$stall_streak}')"
+    event "$name" "$detail"
+    if [ "$STALL_SUSPECTED_NEW" -eq 1 ]; then
+        event stall_suspected "$(printf '%s' "$detail" | jq -c \
+            --argjson required "$STALL_REQUIRED_WINDOWS" \
+            '.+{required_windows:$required,action:"log_only"}')"
+    fi
+}
+
+CURRENT_NODE="$(selected_node "$MEDIA_GROUP")"
+[ -n "$CURRENT_NODE" ] || exit 0
+
+# Cheap activity gate: when nobody has a googlevideo connection, the cron run
+# stops after one API read instead of sampling for eight seconds.
+HAS_GOOGLEVIDEO="$(api "$API_BASE/connections" 2>/dev/null | jq -r \
+    --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" '
+    def gv: (.metadata.host // "" | ascii_downcase) as $h |
+      ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
+    any(.connections[]?;
+      gv and (((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null))' 2>/dev/null)" || exit 0
+[ "$HAS_GOOGLEVIDEO" = true ] || exit 0
+
+PASSIVE_RESULT="$RUN_DIR/passive.json"
+if ! sample_googlevideo "$LOW_WINDOW_SECONDS" "$CURRENT_NODE" "$PASSIVE_RESULT"; then
+    event passive_sample_error '{"stage":"low_speed_window","cause":"api_or_parse_failed"}'
+    exit 0
+fi
+
+PASSIVE_JSON="$(cat "$PASSIVE_RESULT")"
+PASSIVE_BYTES="$(printf '%s' "$PASSIVE_JSON" | jq -r '.total_bytes')"
+PASSIVE_ACTIVE="$(printf '%s' "$PASSIVE_JSON" | jq -r '.active_seconds')"
+PASSIVE_BPS="$(printf '%s' "$PASSIVE_JSON" | jq -r '.bytes_per_active_second')"
+SOURCE_COUNT="$(printf '%s' "$PASSIVE_JSON" | jq -r '.source_ips|length')"
+update_stall_probe
+
+if [ "$SOURCE_COUNT" -gt 1 ]; then
+    # Keep the old streak but do not refresh its timestamp. It naturally expires
+    # after LOW_STREAK_MAX_GAP_SECONDS.
+    log_passive_window multi_device_deferred multi_device_deferred
+    exit 0
+fi
+
+if [ "$SOURCE_COUNT" -eq 1 ] && [ "$PASSIVE_BPS" -ge "$YOUTUBE_TARGET_BYTES_PER_SEC" ] && \
+   { { [ "$PASSIVE_ACTIVE" -ge "$LOW_MIN_ACTIVE_SECONDS" ] && [ "$PASSIVE_BYTES" -ge "$LOW_MIN_BYTES" ]; } || \
+     { [ "$PASSIVE_ACTIVE" -ge "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" ] && [ "$PASSIVE_BYTES" -ge "$FAST_POSITIVE_MIN_BYTES" ]; }; }; then
+    rm -f "$LOW_STREAK_FILE"
+    log_passive_window youtube_target_satisfied target_satisfied
+    exit 0
+fi
+
+if [ "$SOURCE_COUNT" -ne 1 ] || [ "$PASSIVE_ACTIVE" -lt "$LOW_MIN_ACTIVE_SECONDS" ] || [ "$PASSIVE_BYTES" -lt "$LOW_MIN_BYTES" ]; then
+    # An inconclusive/pause-like window is not evidence that the node recovered.
+    # Keep any earlier valid low windows without refreshing their timestamp; the
+    # normal max-gap check will ignore stale evidence on the next valid window.
+    log_passive_window passive_sample insufficient
+    exit 0
+fi
+
+TRIGGER_SOURCE="$(printf '%s' "$PASSIVE_JSON" | jq -r '.source_ips[0]')"
+if [ "$PASSIVE_BPS" -ge "$YOUTUBE_TARGET_BYTES_PER_SEC" ]; then
+    rm -f "$LOW_STREAK_FILE"
+    log_passive_window youtube_target_satisfied target_satisfied
+    exit 0
+fi
+
+NOW="$(date +%s)"
+STREAK=''
+if [ -r "$LOW_STREAK_FILE" ]; then
+    STREAK="$(cat "$LOW_STREAK_FILE" 2>/dev/null)"
+fi
+if [ -n "$STREAK" ] && printf '%s' "$STREAK" | jq -e \
+    --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson now "$NOW" \
+    --argjson gap "$LOW_STREAK_MAX_GAP_SECONDS" \
+    '.node==$node and .source_ip==$source and (($now-.last_epoch) <= $gap)' >/dev/null 2>&1; then
+    STREAK="$(printf '%s' "$STREAK" | jq -c \
+        --argjson now "$NOW" --argjson bytes "$PASSIVE_BYTES" --argjson active "$PASSIVE_ACTIVE" \
+        --argjson needed "$LOW_REQUIRED_WINDOWS" \
+        '.last_epoch=$now | .samples=((.samples+[{bytes:$bytes,active:$active}]) | .[-$needed:])')"
+else
+    STREAK="$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" \
+        --argjson now "$NOW" --argjson bytes "$PASSIVE_BYTES" --argjson active "$PASSIVE_ACTIVE" \
+        '{node:$node,source_ip:$source,last_epoch:$now,samples:[{bytes:$bytes,active:$active}]}')"
+fi
+if ! printf '%s' "$STREAK" | jq -e \
+    '(.node|type)=="string" and (.source_ip|type)=="string" and (.last_epoch|type)=="number" and (.samples|type)=="array"' \
+    >/dev/null 2>&1; then
+    event low_speed_state_error '{"cause":"invalid_generated_streak"}'
+    rm -f "$LOW_STREAK_FILE"
+    exit 0
+fi
+atomic_write "$LOW_STREAK_FILE" "$STREAK"
+STREAK_COUNT="$(printf '%s' "$STREAK" | jq -r '.samples|length')"
+PASSIVE_JSON="$(printf '%s' "$PASSIVE_JSON" | jq -c --argjson count "$STREAK_COUNT" --argjson needed "$LOW_REQUIRED_WINDOWS" '.+{low_window_count:$count,low_required_windows:$needed}')"
+log_passive_window low_speed_window low_speed
+[ "$STREAK_COUNT" -ge "$LOW_REQUIRED_WINDOWS" ] || exit 0
+
+LAST_ATTEMPT=0
+[ -r "$LAST_ATTEMPT_FILE" ] && LAST_ATTEMPT="$(cat "$LAST_ATTEMPT_FILE" 2>/dev/null)"
+is_uint "$LAST_ATTEMPT" || LAST_ATTEMPT=0
+if [ $((NOW - LAST_ATTEMPT)) -lt "$CHALLENGE_BACKOFF_SECONDS" ]; then
+    event low_speed_deferred "$(jq -nc --argjson retry_after "$((LAST_ATTEMPT + CHALLENGE_BACKOFF_SECONDS))" '{cause:"challenge_backoff",retry_after:$retry_after}')"
+    exit 0
+fi
+
+BASELINE_BYTES="$(printf '%s' "$STREAK" | jq -r '[.samples[].bytes]|add//0')"
+BASELINE_ACTIVE="$(printf '%s' "$STREAK" | jq -r '[.samples[].active]|add//0')"
+BASELINE_BPS=$((BASELINE_BYTES / BASELINE_ACTIVE))
+durable_write "$LAST_ATTEMPT_FILE" "$NOW" || exit 1
+rm -f "$LOW_STREAK_FILE"
+event low_speed_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson bps "$BASELINE_BPS" --argjson target "$YOUTUBE_TARGET_BYTES_PER_SEC" '{old_node:$node,source_ip:$source,baseline_bytes_per_active_second:$bps,target_bytes_per_second:$target}')"
+
+penalty_until()
+{
+    node="$1"
+    if [ ! -r "$PENALTY_FILE" ]; then
+        printf '0\n'
+        return
+    fi
+    value="$(jq -r --arg node "$node" '.[$node].until // 0' "$PENALTY_FILE" 2>/dev/null)"
+    is_uint "$value" || value=0
+    printf '%s\n' "$value"
+}
+
+set_penalty()
+{
+    node="$1"
+    kind="$2"
+    seconds="$3"
+    now="$(date +%s)"
+    until=$((now + seconds))
+    current='{}'
+    [ -r "$PENALTY_FILE" ] && current="$(cat "$PENALTY_FILE" 2>/dev/null)"
+    printf '%s' "$current" | jq -e 'type=="object"' >/dev/null 2>&1 || current='{}'
+    updated="$(printf '%s' "$current" | jq -c --arg node "$node" --arg kind "$kind" \
+        --argjson until "$until" --argjson now "$now" \
+        'with_entries(select(.value.until > $now)) | .[$node]={kind:$kind,until:$until}')"
+    durable_write "$PENALTY_FILE" "$updated"
+    event node_penalized "$(jq -nc --arg node "$node" --arg kind "$kind" --argjson until "$until" '{node:$node,kind:$kind,until:$until}')"
+}
+
+clear_inconclusive_count()
+{
+    node="$1"
+    [ -r "$INCONCLUSIVE_FILE" ] || return 0
+    current="$(cat "$INCONCLUSIVE_FILE" 2>/dev/null)"
+    updated="$(printf '%s' "$current" | jq -c --arg node "$node" 'del(.[$node])' 2>/dev/null)" || return 0
+    durable_write "$INCONCLUSIVE_FILE" "$updated"
+}
+
+# The first user/sample-driven inconclusive verdict is not a node failure.
+# Only a second one for the same node within the configured gap gets a short
+# retry-after penalty, preventing a loop without overreacting to one burst.
+record_inconclusive()
+{
+    node="$1"
+    now="$(date +%s)"
+    current='{}'
+    [ -r "$INCONCLUSIVE_FILE" ] && current="$(cat "$INCONCLUSIVE_FILE" 2>/dev/null)"
+    printf '%s' "$current" | jq -e 'type=="object"' >/dev/null 2>&1 || current='{}'
+    count="$(printf '%s' "$current" | jq -r --arg node "$node" --argjson now "$now" \
+        --argjson gap "$INCONCLUSIVE_COUNT_MAX_GAP_SECONDS" \
+        '(.[$node] // {}) as $x | if (($x.last_epoch // 0)>0 and ($now-($x.last_epoch // 0))<= $gap) then (($x.count // 0)+1) else 1 end')"
+    is_uint "$count" || count=1
+    INCONCLUSIVE_COUNT="$count"
+    INCONCLUSIVE_PENALIZED=0
+    if [ "$count" -ge "$INCONCLUSIVE_REQUIRED_COUNT" ]; then
+        updated="$(printf '%s' "$current" | jq -c --arg node "$node" --argjson now "$now" \
+            'with_entries(select((.value.last_epoch // 0)>0)) | del(.[$node])')"
+        durable_write "$INCONCLUSIVE_FILE" "$updated" || return 1
+        set_penalty "$node" inconclusive "$INCONCLUSIVE_RETRY_SECONDS"
+        INCONCLUSIVE_PENALIZED=1
+    else
+        updated="$(printf '%s' "$current" | jq -c --arg node "$node" --argjson now "$now" --argjson count "$count" \
+            '.[$node]={count:$count,last_epoch:$now}')"
+        durable_write "$INCONCLUSIVE_FILE" "$updated" || return 1
+    fi
+}
+
+DELAY_JSON="$(api -G --data-urlencode "url=$DELAY_TEST_URL" --data-urlencode 'timeout=5000' \
+    "$API_BASE/group/$BENCH_GROUP/delay" 2>/dev/null)" || {
+    event preselection_error '{"stage":"delay_test","cause":"api_failed"}'
+    exit 0
+}
+MEDIA_JSON="$(api "$API_BASE/proxies/$MEDIA_GROUP" 2>/dev/null)" || exit 0
+ALLOWED_NODES="$(printf '%s' "$MEDIA_JSON" | jq -c '.all // []')"
+DELAY_ORDER="$RUN_DIR/delay_order"
+printf '%s' "$DELAY_JSON" | jq -r --argjson allowed "$ALLOWED_NODES" --argjson max "$MAX_DELAY_MS" '
+  to_entries |
+  map(. as $e | select(($e.value|type)=="number" and $e.value>0 and $e.value<$max and (($allowed|index($e.key))!=null))) |
+  sort_by(.value) | .[].key' > "$DELAY_ORDER"
+
+CANDIDATES="$RUN_DIR/candidates"
+: > "$CANDIDATES"
+printf '%s\n' "$CURRENT_NODE" >> "$CANDIDATES"
+challenger_count=0
+while IFS= read -r node; do
+    [ -n "$node" ] || continue
+    [ "$node" = "$CURRENT_NODE" ] && continue
+    until="$(penalty_until "$node")"
+    [ "$until" -gt "$NOW" ] && continue
+    printf '%s\n' "$node" >> "$CANDIDATES"
+    challenger_count=$((challenger_count + 1))
+    [ "$challenger_count" -ge "$MAX_CHALLENGERS" ] && break
+done < "$DELAY_ORDER"
+
+if [ "$challenger_count" -eq 0 ]; then
+    event preselection_error '{"stage":"candidate_selection","cause":"no_eligible_challenger"}'
+    exit 0
+fi
+
+verify_benchmark_chain()
+{
+    node="$1"
+    sequence="$2"
+    verify_err="$RUN_DIR/chain-verify.$sequence.err"
+    verify_end_byte=1048575
+    (
+        curl -sS -x "http://127.0.0.1:$BENCH_PROXY_PORT" \
+            --connect-timeout 2 --max-time "$CHAIN_VERIFY_SECONDS" \
+            --limit-rate "$CHAIN_VERIFY_RATE_BYTES_PER_SEC" \
+            --range "0-$verify_end_byte" -o /dev/null \
+            "$BENCH_URL" 2> "$verify_err"
+    ) &
+    verify_pid=$!
+
+    verified_chains=''
+    polls=0
+    while kill -0 "$verify_pid" 2>/dev/null && [ "$polls" -lt "$CHAIN_VERIFY_SECONDS" ]; do
+        sleep 1
+        connections="$(api "$API_BASE/connections" 2>/dev/null)" || connections=''
+        if [ -n "$connections" ]; then
+            verified_chains="$(printf '%s' "$connections" | jq -c \
+                --arg host "$BENCH_HOST" --arg group "$BENCH_GROUP" --arg node "$node" '
+                [.connections[]? |
+                  select((.metadata.host // "" | ascii_downcase)==($host|ascii_downcase)) |
+                  select((.metadata.sourceIP // "") == "127.0.0.1" or (.metadata.sourceIP // "") == "::1") |
+                  select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+                  .chains][0] // empty' 2>/dev/null)"
+            [ -n "$verified_chains" ] && break
+        fi
+        polls=$((polls + 1))
+    done
+    wait "$verify_pid" 2>/dev/null
+
+    if [ -z "$verified_chains" ]; then
+        event chain_verify_fail "$(jq -nc --arg node "$node" --arg host "$BENCH_HOST" '{node:$node,host:$host,stage:"dedicated_preflight"}')"
+        return 1
+    fi
+    event chain_verified "$(jq -nc --arg node "$node" --argjson chains "$verified_chains" '{node:$node,stage:"dedicated_preflight",chains:$chains}')"
+    return 0
+}
+
+benchmark_node()
+{
+    node="$1"
+    delay="$2"
+    sequence="$3"
+    payload="$(jq -nc --arg name "$node" '{name:$name}')"
+    if ! api -X PUT -H 'Content-Type: application/json' -d "$payload" \
+        "$API_BASE/proxies/$BENCH_GROUP" >/dev/null 2>&1 ||
+       ! verify_selection "$BENCH_GROUP" "$node"; then
+        event candidate_error "$(jq -nc --arg node "$node" --arg stage switch_bench '{node:$node,stage:$stage}')"
+        return 1
+    fi
+
+    verify_benchmark_chain "$node" "$sequence" || return 1
+
+    out="$RUN_DIR/curl.$sequence.out"
+    err="$RUN_DIR/curl.$sequence.err"
+    end_byte=$((BENCH_MAX_BYTES - 1))
+    test_url="$BENCH_URL"
+    curl -sS -x "http://127.0.0.1:$BENCH_PROXY_PORT" \
+        --connect-timeout 4 --max-time "$BENCH_TEST_SECONDS" \
+        --range "0-$end_byte" -H 'Cache-Control: no-cache' \
+        -o /dev/null -w '%{http_code} %{size_download} %{time_total} %{speed_download}\n' \
+        "$test_url" > "$out" 2> "$err"
+    curl_status="$?"
+    set -- $(cat "$out" 2>/dev/null)
+    http_code="${1:-0}"
+    size_download="${2:-0}"
+    time_total="${3:-0}"
+    speed_download="${4:-0}"
+    bytes="$(awk -v value="$size_download" 'BEGIN{printf "%.0f",value+0}')"
+    bps="$(awk -v value="$speed_download" 'BEGIN{printf "%.0f",value+0}')"
+
+    case "$curl_status" in 0|28) ;; *)
+        event candidate_error "$(jq -nc --arg node "$node" --arg stage download --argjson curl_status "$curl_status" '{node:$node,stage:$stage,curl_status:$curl_status}')"
+        return 1 ;;
+    esac
+    case "$http_code" in 200|206) ;; *)
+        event candidate_error "$(jq -nc --arg node "$node" --arg stage http --arg http_code "$http_code" '{node:$node,stage:$stage,http_code:$http_code}')"
+        return 1 ;;
+    esac
+    if [ "$bytes" -lt "$BENCH_MIN_VALID_BYTES" ]; then
+        event candidate_error "$(jq -nc --arg node "$node" --arg stage minimum_bytes --argjson bytes "$bytes" '{node:$node,stage:$stage,download_bytes:$bytes}')"
+        return 1
+    fi
+    if ! verify_selection "$BENCH_GROUP" "$node"; then
+        event candidate_error "$(jq -nc --arg node "$node" --arg stage bench_changed_during_download '{node:$node,stage:$stage}')"
+        return 1
+    fi
+
+    event candidate_result "$(jq -nc --arg node "$node" --argjson delay "$delay" \
+        --argjson bytes "$bytes" --argjson bps "$bps" --arg time "$time_total" \
+        --argjson chains "$verified_chains" \
+        '{node:$node,delay_ms:$delay,download_bytes:$bytes,bytes_per_second:$bps,time_total:$time,chains:$chains}')"
+    printf '%s\t%s\t%s\n' "$node" "$bps" "$delay" >> "$RUN_DIR/results"
+}
+
+: > "$RUN_DIR/results"
+sequence=0
+while IFS= read -r node; do
+    [ -n "$node" ] || continue
+    delay="$(printf '%s' "$DELAY_JSON" | jq -r --arg node "$node" '.[$node] // 99999')"
+    sequence=$((sequence + 1))
+    benchmark_node "$node" "$delay" "$sequence"
+done < "$CANDIDATES"
+
+# The current node is measured for diagnostics only. Since real YouTube traffic
+# already proved it slow, choose the best valid non-current challenger even if
+# its dl.google proxy score is lower than the current node's score.
+CHALLENGER="$(awk -F '\t' -v current="$CURRENT_NODE" '$1!=current {if(!found || $2>best){found=1;best=$2;node=$1}} END{print node}' "$RUN_DIR/results")"
+if [ -z "$CHALLENGER" ]; then
+    event preselection_error '{"stage":"download_test","cause":"no_valid_challenger"}'
+    exit 0
+fi
+CHALLENGER_BPS="$(awk -F '\t' -v node="$CHALLENGER" '$1==node {print $2;exit}' "$RUN_DIR/results")"
+
+googlevideo_connection_ids()
+{
+    node="$1"
+    source="$2"
+    output="$3"
+    api "$API_BASE/connections" 2>/dev/null | jq -r \
+        --arg group "$MEDIA_GROUP" --arg node "$node" --arg source "$source" '
+        def gv: (.metadata.host // "" | ascii_downcase) as $h |
+          ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
+        .connections[]? | select(gv) |
+        select((.metadata.sourceIP // "") == $source) |
+        select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+        .id' > "$output"
+}
+
+# ENABLED may have been changed during the 15-20 second preselection phase.
+if ! new_challenges_enabled; then
+    event challenge_cancelled '{"stage":"before_pending","cause":"disabled"}'
+    exit 0
+fi
+
+CURRENT_BEFORE_SWITCH="$(selected_node "$MEDIA_GROUP")"
+if [ "$CURRENT_BEFORE_SWITCH" != "$CURRENT_NODE" ]; then
+    event challenge_cancelled "$(jq -nc --arg expected "$CURRENT_NODE" --arg actual "$CURRENT_BEFORE_SWITCH" '{stage:"before_pending",cause:"selector_changed_externally",expected_node:$expected,actual_node:$actual}')"
+    exit 0
+fi
+if ! group_has_node "$MEDIA_GROUP" "$CHALLENGER"; then
+    event challenge_cancelled "$(jq -nc --arg node "$CHALLENGER" '{stage:"before_pending",cause:"challenger_missing_after_config_update",node:$node}')"
+    exit 0
+fi
+
+OLD_CONNECTION_IDS="$RUN_DIR/old_connection_ids"
+googlevideo_connection_ids "$CURRENT_NODE" "$TRIGGER_SOURCE" "$OLD_CONNECTION_IDS" || {
+    event challenge_cancelled '{"stage":"connection_snapshot","cause":"api_or_parse_failed"}'
+    exit 0
+}
+
+write_pending "$CURRENT_NODE" "$CHALLENGER" "$TRIGGER_SOURCE" || {
+    event challenge_cancelled '{"stage":"pending_write","cause":"write_failed"}'
+    exit 1
+}
+event challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson baseline "$BASELINE_BPS" --argjson preselect_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,source_ip:$source,baseline_bytes_per_active_second:$baseline,preselection_bytes_per_second:$preselect_bps}')"
+
+if ! put_selection "$MEDIA_GROUP" "$CHALLENGER" || ! verify_selection "$MEDIA_GROUP" "$CHALLENGER"; then
+    event challenge_switch_error "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" '{old_node:$old,new_node:$new}')"
+    rollback_owned_transaction "$CURRENT_NODE" "$CHALLENGER" switch_or_verify_failed
+    exit 0
+fi
+
+killed_ids='[]'
+if [ "$KILL_OLD_CONNECTIONS" = 1 ]; then
+    sleep 2
+fi
+POST_SWITCH_NODE="$(selected_node "$MEDIA_GROUP")"
+if [ "$POST_SWITCH_NODE" != "$CHALLENGER" ]; then
+    event challenge_cancelled "$(jq -nc --arg expected "$CHALLENGER" --arg actual "$POST_SWITCH_NODE" '{stage:"before_connection_close",cause:"selector_changed_or_unreadable",expected_node:$expected,actual_node:$actual}')"
+    rollback_owned_transaction "$CURRENT_NODE" "$CHALLENGER" selector_changed_before_connection_close
+    exit 0
+fi
+if [ "$KILL_OLD_CONNECTIONS" = 1 ]; then
+    while IFS= read -r connection_id; do
+        [ -n "$connection_id" ] || continue
+        if api -X DELETE "$API_BASE/connections/$connection_id" >/dev/null 2>&1; then
+            killed_ids="$(printf '%s' "$killed_ids" | jq -c --arg id "$connection_id" '.+[$id]')"
+        fi
+    done < "$OLD_CONNECTION_IDS"
+fi
+event connections_killed "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson ids "$killed_ids" '{old_node:$old,new_node:$new,count:($ids|length),connection_ids:$ids}')"
+
+OBSERVE_RESULT="$RUN_DIR/observe.json"
+if ! sample_googlevideo "$OBSERVE_SECONDS" "$CHALLENGER" "$OBSERVE_RESULT"; then
+    event challenge_inconclusive '{"cause":"observation_api_or_parse_failed","node_penalty":false}'
+    rollback_owned_transaction "$CURRENT_NODE" "$CHALLENGER" observation_infrastructure_error
+    exit 0
+fi
+
+OBSERVE_JSON="$(cat "$OBSERVE_RESULT")"
+NEW_BYTES="$(printf '%s' "$OBSERVE_JSON" | jq -r '.total_bytes')"
+NEW_ACTIVE="$(printf '%s' "$OBSERVE_JSON" | jq -r '.active_seconds')"
+NEW_BPS="$(printf '%s' "$OBSERVE_JSON" | jq -r '.bytes_per_active_second')"
+NEW_SOURCE_COUNT="$(printf '%s' "$OBSERVE_JSON" | jq -r '.source_ips|length')"
+NEW_SOURCE="$(printf '%s' "$OBSERVE_JSON" | jq -r '.source_ips[0] // empty')"
+event challenge_sample "$(printf '%s' "$OBSERVE_JSON" | jq -c --arg source_expected "$TRIGGER_SOURCE" '.+{source_expected:$source_expected}')"
+
+SELECTOR_AFTER_OBSERVE="$(selected_node "$MEDIA_GROUP")"
+if [ "$SELECTOR_AFTER_OBSERVE" != "$CHALLENGER" ]; then
+    event challenge_cancelled "$(jq -nc --arg expected "$CHALLENGER" --arg actual "$SELECTOR_AFTER_OBSERVE" '{stage:"after_observation",cause:"selector_changed_or_unreadable",expected_node:$expected,actual_node:$actual}')"
+    rollback_owned_transaction "$CURRENT_NODE" "$CHALLENGER" selector_changed_during_observation
+    exit 0
+fi
+
+ratio_required=$((BASELINE_BPS * KEEP_RATIO_PERCENT / 100))
+delta_required=$((BASELINE_BPS + KEEP_MIN_DELTA_BYTES_PER_SEC))
+target_reached=0
+material_improvement=0
+[ "$NEW_BPS" -ge "$YOUTUBE_TARGET_BYTES_PER_SEC" ] && target_reached=1
+if [ "$NEW_BPS" -ge "$ratio_required" ] && [ "$NEW_BPS" -ge "$delta_required" ]; then
+    material_improvement=1
+fi
+
+sample_owner_valid=0
+standard_sample=0
+fast_positive_sample=0
+if [ "$NEW_SOURCE_COUNT" -eq 1 ] && [ "$NEW_SOURCE" = "$TRIGGER_SOURCE" ]; then
+    sample_owner_valid=1
+    if [ "$NEW_ACTIVE" -ge "$OBSERVE_MIN_ACTIVE_SECONDS" ] && [ "$NEW_BYTES" -ge "$OBSERVE_MIN_BYTES" ]; then
+        standard_sample=1
+    fi
+    if [ "$NEW_ACTIVE" -ge "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" ] && [ "$NEW_BYTES" -ge "$FAST_POSITIVE_MIN_BYTES" ]; then
+        fast_positive_sample=1
+    fi
+fi
+
+if [ "$sample_owner_valid" -eq 1 ] && \
+   { [ "$standard_sample" -eq 1 ] || [ "$fast_positive_sample" -eq 1 ]; } && \
+   { [ "$target_reached" -eq 1 ] || [ "$material_improvement" -eq 1 ]; }; then
+    # SELECTOR_AFTER_OBSERVE was already verified immediately before the KEEP
+    # calculation. A second control-plane read adds a failure mode but cannot
+    # make this commit atomic; once the data verdict is KEEP, pending must never
+    # later be interpreted as an in-progress challenge and rolled back.
+    clear_inconclusive_count "$CHALLENGER"
+    clear_pending
+    event challenge_success "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson old_bps "$BASELINE_BPS" --argjson new_bps "$NEW_BPS" --argjson target "$target_reached" --argjson material "$material_improvement" --argjson fast "$fast_positive_sample" '{old_node:$old,new_node:$new,old_bytes_per_active_second:$old_bps,new_bytes_per_active_second:$new_bps,target_reached:($target==1),material_improvement:($material==1),fast_positive_sample:($fast==1),selector_verified_after_observation:true}')"
+    exit 0
+fi
+
+if [ "$standard_sample" -ne 1 ]; then
+    record_inconclusive "$CHALLENGER"
+    event challenge_inconclusive "$(jq -nc --arg node "$CHALLENGER" --argjson bytes "$NEW_BYTES" --argjson active "$NEW_ACTIVE" --argjson sources "$NEW_SOURCE_COUNT" --argjson count "$INCONCLUSIVE_COUNT" --argjson penalized "$INCONCLUSIVE_PENALIZED" '{node:$node,cause:"insufficient_or_changed_user_sample",total_bytes:$bytes,active_seconds:$active,source_count:$sources,inconclusive_count:$count,node_penalty:(if $penalized==1 then "retry_after" else false end)}')"
+    rollback_owned_transaction "$CURRENT_NODE" "$CHALLENGER" observation_inconclusive
+    exit 0
+fi
+
+clear_inconclusive_count "$CHALLENGER"
+set_penalty "$CHALLENGER" failed "$FAILED_BLACKLIST_SECONDS"
+event challenge_failed "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson old_bps "$BASELINE_BPS" --argjson new_bps "$NEW_BPS" --argjson ratio_required "$ratio_required" --argjson delta_required "$delta_required" '{old_node:$old,new_node:$new,old_bytes_per_active_second:$old_bps,new_bytes_per_active_second:$new_bps,ratio_required:$ratio_required,delta_required:$delta_required}')"
+rollback_owned_transaction "$CURRENT_NODE" "$CHALLENGER" insufficient_improvement
+exit 0
