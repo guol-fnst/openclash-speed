@@ -1,4 +1,4 @@
-# OpenClash YouTube MEDIA selector V1.2
+# OpenClash YouTube/X MEDIA selector V1.3
 
 This directory is the reviewable source of the router deployment.
 `config.example` deliberately defaults to `ENABLED=0`; the deployed router
@@ -19,7 +19,7 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 There is intentionally no installer script. Deployment remains a separate,
 explicit and backed-up operation.
 
-## Exact V1.2 behavior
+## Exact V1.3 behavior
 
 Every cron run takes a kernel `flock`. It then handles a durable pending
 transaction before looking at `ENABLED`:
@@ -28,7 +28,7 @@ transaction before looking at `ENABLED`:
 OpenClash API unavailable -> leave pending untouched, exit
 pending exists            -> recover/finish it, exit
 ENABLED != 1              -> exit
-no current googlevideo    -> exit after one /connections read
+no current googlevideo/X  -> exit after one /connections read
 ```
 
 When enabled and real Googlevideo traffic exists:
@@ -149,8 +149,21 @@ The previous streak is not refreshed and therefore expires after 180 seconds.
 If a second device begins during the challenge observation, the result becomes
 inconclusive and rolls back.
 
-This is a YouTube optimizer. X shares MEDIA and usually benefits from the same
-node, but X traffic neither triggers nor validates a challenge.
+YouTube remains the primary optimizer and uses real Googlevideo delivery as its
+final verdict. X/Twitter traffic is also an activity trigger. When X is active
+without concurrent Googlevideo traffic, at most once per hour the script runs
+the existing current-node plus candidate `dl.google.com` throughput comparison.
+It switches MEDIA only when the best candidate is at least 20% and 125000
+bytes/s (about 1 Mbps) faster than the current node. This deliberately assumes
+that a generally faster Google-network path is a useful proxy for X; it does not
+claim to measure X CDN throughput directly.
+
+An X-triggered run uses the same BENCH listener and chain verification, durable
+pending transaction, selector read-back and external-user protection. On a
+successful switch it closes only the triggering device's pre-switch X,
+Twitter and twimg connections so the client reconnects. It does not run the
+30-second Googlevideo verdict because no YouTube session may exist. YouTube has
+priority whenever both services are active.
 
 ## Diagnostic-only stall probe
 
@@ -191,6 +204,6 @@ at the configured size.
 /etc/crontabs/root                                   # once per minute
 ```
 
-V1.2 replaced only the selector and its configuration. The existing Ruby
+V1.3 replaced only the selector and its configuration. The existing Ruby
 patcher, overwrite hook and cron entry were retained. Future changes should use
 the same lock, backup and atomic-replace procedure.

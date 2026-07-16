@@ -52,3 +52,6 @@
   validation and successful commit.
 - V1.2 additionally lowered champion slow-evidence minima to two active seconds
   and 256 KiB, while leaving the stricter challenger rollback evidence intact.
+- V1.3 adds an hourly X activity trigger that reuses the existing Google-network
+  throughput benchmark. It requires measured improvement over the current node
+  before switching and intentionally does not present that proxy as X truth.

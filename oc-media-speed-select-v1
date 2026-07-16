@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# YouTube-aware OpenClash MEDIA selector, review build.
+# YouTube/X-aware OpenClash MEDIA selector.
 # POSIX/BusyBox ash compatible. No action is started when ENABLED=0, but an
 # existing challenge_pending transaction is still recovered.
 
@@ -22,6 +22,8 @@ CONFIG="${CONFIG:-/etc/openclash/speed-select/config}"
 : "${BENCH_MIN_VALID_BYTES:=262144}"
 : "${CHAIN_VERIFY_SECONDS:=3}"
 : "${CHAIN_VERIFY_RATE_BYTES_PER_SEC:=65536}"
+: "${X_TRIGGER_ENABLED:=1}"
+: "${X_PROBE_COOLDOWN_SECONDS:=3600}"
 : "${YOUTUBE_TARGET_BYTES_PER_SEC:=1000000}"
 : "${LOW_WINDOW_SECONDS:=8}"
 : "${LOW_REQUIRED_WINDOWS:=3}"
@@ -59,6 +61,7 @@ PENDING_FILE="$PERSIST_DIR/challenge_pending"
 PENALTY_FILE="$PERSIST_DIR/node_penalties.json"
 INCONCLUSIVE_FILE="$PERSIST_DIR/inconclusive_counts.json"
 LAST_ATTEMPT_FILE="$PERSIST_DIR/last_challenge_attempt"
+LAST_X_PROBE_FILE="$PERSIST_DIR/last_x_probe"
 LOW_STREAK_FILE="$VOLATILE_DIR/low_streak.json"
 STALL_STREAK_FILE="$VOLATILE_DIR/stall_streak.json"
 RUN_ID="$(date +%s)-$$"
@@ -72,6 +75,7 @@ is_uint()
 for value in "$BENCH_PROXY_PORT" "$MAX_DELAY_MS" "$MAX_CHALLENGERS" \
     "$BENCH_TEST_SECONDS" "$BENCH_MAX_BYTES" "$BENCH_MIN_VALID_BYTES" \
     "$CHAIN_VERIFY_SECONDS" "$CHAIN_VERIFY_RATE_BYTES_PER_SEC" \
+    "$X_TRIGGER_ENABLED" "$X_PROBE_COOLDOWN_SECONDS" \
     "$YOUTUBE_TARGET_BYTES_PER_SEC" "$LOW_WINDOW_SECONDS" \
     "$LOW_REQUIRED_WINDOWS" "$LOW_MIN_ACTIVE_SECONDS" "$LOW_MIN_BYTES" \
     "$LOW_STREAK_MAX_GAP_SECONDS" "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" \
@@ -481,15 +485,57 @@ log_passive_window()
 CURRENT_NODE="$(selected_node "$MEDIA_GROUP")"
 [ -n "$CURRENT_NODE" ] || exit 0
 
-# Cheap activity gate: when nobody has a googlevideo connection, the cron run
-# stops after one API read instead of sampling for eight seconds.
-HAS_GOOGLEVIDEO="$(api "$API_BASE/connections" 2>/dev/null | jq -r \
+# Cheap activity gate. YouTube retains priority when both services are active;
+# otherwise real X/Twitter traffic may start the same active candidate test.
+GATE_CONNECTIONS="$(api "$API_BASE/connections" 2>/dev/null)" || exit 0
+HAS_GOOGLEVIDEO="$(printf '%s' "$GATE_CONNECTIONS" | jq -r \
     --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" '
     def gv: (.metadata.host // "" | ascii_downcase) as $h |
       ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
     any(.connections[]?;
       gv and (((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null))' 2>/dev/null)" || exit 0
-[ "$HAS_GOOGLEVIDEO" = true ] || exit 0
+
+TRIGGER_KIND=youtube
+if [ "$HAS_GOOGLEVIDEO" != true ]; then
+    [ "$X_TRIGGER_ENABLED" = 1 ] || exit 0
+    X_SOURCE_IPS="$(printf '%s' "$GATE_CONNECTIONS" | jq -c \
+        --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" '
+        def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
+          ($h == "x.com" or ($h | endswith(".x.com")) or
+           $h == "twitter.com" or ($h | endswith(".twitter.com")) or
+           $h == "twimg.com" or ($h | endswith(".twimg.com")));
+        [.connections[]? | select(xtraffic) |
+          select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+          (.metadata.sourceIP // "") | select(length>0)] | unique' 2>/dev/null)" || exit 0
+    X_SOURCE_COUNT="$(printf '%s' "$X_SOURCE_IPS" | jq -r 'length')"
+    [ "$X_SOURCE_COUNT" -gt 0 ] || exit 0
+    if [ "$X_SOURCE_COUNT" -ne 1 ]; then
+        event x_multi_device_deferred "$(jq -nc --argjson sources "$X_SOURCE_IPS" '{source_ips:$sources}')"
+        exit 0
+    fi
+
+    NOW="$(date +%s)"
+    LAST_X_PROBE=0
+    [ -r "$LAST_X_PROBE_FILE" ] && LAST_X_PROBE="$(cat "$LAST_X_PROBE_FILE" 2>/dev/null)"
+    is_uint "$LAST_X_PROBE" || LAST_X_PROBE=0
+    [ $((NOW - LAST_X_PROBE)) -ge "$X_PROBE_COOLDOWN_SECONDS" ] || exit 0
+
+    LAST_ATTEMPT=0
+    [ -r "$LAST_ATTEMPT_FILE" ] && LAST_ATTEMPT="$(cat "$LAST_ATTEMPT_FILE" 2>/dev/null)"
+    is_uint "$LAST_ATTEMPT" || LAST_ATTEMPT=0
+    if [ $((NOW - LAST_ATTEMPT)) -lt "$CHALLENGE_BACKOFF_SECONDS" ]; then
+        event x_probe_deferred "$(jq -nc --argjson retry_after "$((LAST_ATTEMPT + CHALLENGE_BACKOFF_SECONDS))" '{cause:"challenge_backoff",retry_after:$retry_after}')"
+        exit 0
+    fi
+
+    TRIGGER_KIND=x
+    TRIGGER_SOURCE="$(printf '%s' "$X_SOURCE_IPS" | jq -r '.[0]')"
+    durable_write "$LAST_X_PROBE_FILE" "$NOW" || exit 1
+    durable_write "$LAST_ATTEMPT_FILE" "$NOW" || exit 1
+    event x_access_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson cooldown "$X_PROBE_COOLDOWN_SECONDS" '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,benchmark:"dl.google.com"}')"
+fi
+
+if [ "$TRIGGER_KIND" = youtube ]; then
 
 PASSIVE_RESULT="$RUN_DIR/passive.json"
 if ! sample_googlevideo "$LOW_WINDOW_SECONDS" "$CURRENT_NODE" "$PASSIVE_RESULT"; then
@@ -579,6 +625,8 @@ BASELINE_BPS=$((BASELINE_BYTES / BASELINE_ACTIVE))
 durable_write "$LAST_ATTEMPT_FILE" "$NOW" || exit 1
 rm -f "$LOW_STREAK_FILE"
 event low_speed_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson bps "$BASELINE_BPS" --argjson target "$YOUTUBE_TARGET_BYTES_PER_SEC" '{old_node:$node,source_ip:$source,baseline_bytes_per_active_second:$bps,target_bytes_per_second:$target}')"
+
+fi
 
 penalty_until()
 {
@@ -773,8 +821,8 @@ benchmark_node()
 
     event candidate_result "$(jq -nc --arg node "$node" --argjson delay "$delay" \
         --argjson bytes "$bytes" --argjson bps "$bps" --arg time "$time_total" \
-        --argjson chains "$verified_chains" \
-        '{node:$node,delay_ms:$delay,download_bytes:$bytes,bytes_per_second:$bps,time_total:$time,chains:$chains}')"
+        --argjson chains "$verified_chains" --arg trigger "$TRIGGER_KIND" \
+        '{node:$node,trigger:$trigger,delay_ms:$delay,download_bytes:$bytes,bytes_per_second:$bps,time_total:$time,chains:$chains}')"
     printf '%s\t%s\t%s\n' "$node" "$bps" "$delay" >> "$RUN_DIR/results"
 }
 
@@ -787,15 +835,30 @@ while IFS= read -r node; do
     benchmark_node "$node" "$delay" "$sequence"
 done < "$CANDIDATES"
 
-# The current node is measured for diagnostics only. Since real YouTube traffic
-# already proved it slow, choose the best valid non-current challenger even if
-# its dl.google proxy score is lower than the current node's score.
 CHALLENGER="$(awk -F '\t' -v current="$CURRENT_NODE" '$1!=current {if(!found || $2>best){found=1;best=$2;node=$1}} END{print node}' "$RUN_DIR/results")"
 if [ -z "$CHALLENGER" ]; then
-    event preselection_error '{"stage":"download_test","cause":"no_valid_challenger"}'
+    event preselection_error "$(jq -nc --arg trigger "$TRIGGER_KIND" '{stage:"download_test",cause:"no_valid_challenger",trigger:$trigger}')"
     exit 0
 fi
 CHALLENGER_BPS="$(awk -F '\t' -v node="$CHALLENGER" '$1==node {print $2;exit}' "$RUN_DIR/results")"
+
+if [ "$TRIGGER_KIND" = x ]; then
+    CURRENT_BENCH_BPS="$(awk -F '\t' -v node="$CURRENT_NODE" '$1==node {print $2;exit}' "$RUN_DIR/results")"
+    if ! is_uint "$CURRENT_BENCH_BPS" || [ "$CURRENT_BENCH_BPS" -le 0 ]; then
+        event x_probe_error '{"stage":"download_test","cause":"current_node_has_no_valid_result"}'
+        exit 0
+    fi
+    X_RATIO_REQUIRED=$((CURRENT_BENCH_BPS * KEEP_RATIO_PERCENT / 100))
+    X_DELTA_REQUIRED=$((CURRENT_BENCH_BPS + KEEP_MIN_DELTA_BYTES_PER_SEC))
+    if [ "$CHALLENGER_BPS" -lt "$X_RATIO_REQUIRED" ] || [ "$CHALLENGER_BPS" -lt "$X_DELTA_REQUIRED" ]; then
+        put_selection "$BENCH_GROUP" "$CURRENT_NODE" >/dev/null 2>&1 || true
+        event x_probe_no_switch "$(jq -nc --arg current "$CURRENT_NODE" --arg best "$CHALLENGER" \
+            --argjson current_bps "$CURRENT_BENCH_BPS" --argjson best_bps "$CHALLENGER_BPS" \
+            --argjson ratio_required "$X_RATIO_REQUIRED" --argjson delta_required "$X_DELTA_REQUIRED" \
+            '{current_node:$current,best_candidate:$best,current_bytes_per_second:$current_bps,candidate_bytes_per_second:$best_bps,ratio_required:$ratio_required,delta_required:$delta_required}')"
+        exit 0
+    fi
+fi
 
 googlevideo_connection_ids()
 {
@@ -807,6 +870,23 @@ googlevideo_connection_ids()
         def gv: (.metadata.host // "" | ascii_downcase) as $h |
           ($h == "googlevideo.com" or ($h | endswith(".googlevideo.com")));
         .connections[]? | select(gv) |
+        select((.metadata.sourceIP // "") == $source) |
+        select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+        .id' > "$output"
+}
+
+x_connection_ids()
+{
+    node="$1"
+    source="$2"
+    output="$3"
+    api "$API_BASE/connections" 2>/dev/null | jq -r \
+        --arg group "$MEDIA_GROUP" --arg node "$node" --arg source "$source" '
+        def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
+          ($h == "x.com" or ($h | endswith(".x.com")) or
+           $h == "twitter.com" or ($h | endswith(".twitter.com")) or
+           $h == "twimg.com" or ($h | endswith(".twimg.com")));
+        .connections[]? | select(xtraffic) |
         select((.metadata.sourceIP // "") == $source) |
         select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
         .id' > "$output"
@@ -829,7 +909,11 @@ if ! group_has_node "$MEDIA_GROUP" "$CHALLENGER"; then
 fi
 
 OLD_CONNECTION_IDS="$RUN_DIR/old_connection_ids"
-googlevideo_connection_ids "$CURRENT_NODE" "$TRIGGER_SOURCE" "$OLD_CONNECTION_IDS" || {
+if [ "$TRIGGER_KIND" = x ]; then
+    x_connection_ids "$CURRENT_NODE" "$TRIGGER_SOURCE" "$OLD_CONNECTION_IDS"
+else
+    googlevideo_connection_ids "$CURRENT_NODE" "$TRIGGER_SOURCE" "$OLD_CONNECTION_IDS"
+fi || {
     event challenge_cancelled '{"stage":"connection_snapshot","cause":"api_or_parse_failed"}'
     exit 0
 }
@@ -838,7 +922,11 @@ write_pending "$CURRENT_NODE" "$CHALLENGER" "$TRIGGER_SOURCE" || {
     event challenge_cancelled '{"stage":"pending_write","cause":"write_failed"}'
     exit 1
 }
-event challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson baseline "$BASELINE_BPS" --argjson preselect_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,source_ip:$source,baseline_bytes_per_active_second:$baseline,preselection_bytes_per_second:$preselect_bps}')"
+if [ "$TRIGGER_KIND" = x ]; then
+    event x_challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson current_bps "$CURRENT_BENCH_BPS" --argjson candidate_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,source_ip:$source,current_bytes_per_second:$current_bps,candidate_bytes_per_second:$candidate_bps}')"
+else
+    event challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson baseline "$BASELINE_BPS" --argjson preselect_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,source_ip:$source,baseline_bytes_per_active_second:$baseline,preselection_bytes_per_second:$preselect_bps}')"
+fi
 
 if ! put_selection "$MEDIA_GROUP" "$CHALLENGER" || ! verify_selection "$MEDIA_GROUP" "$CHALLENGER"; then
     event challenge_switch_error "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" '{old_node:$old,new_node:$new}')"
@@ -864,7 +952,13 @@ if [ "$KILL_OLD_CONNECTIONS" = 1 ]; then
         fi
     done < "$OLD_CONNECTION_IDS"
 fi
-event connections_killed "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson ids "$killed_ids" '{old_node:$old,new_node:$new,count:($ids|length),connection_ids:$ids}')"
+event connections_killed "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg trigger "$TRIGGER_KIND" --argjson ids "$killed_ids" '{old_node:$old,new_node:$new,trigger:$trigger,count:($ids|length),connection_ids:$ids}')"
+
+if [ "$TRIGGER_KIND" = x ]; then
+    clear_pending
+    event x_challenge_success "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson old_bps "$CURRENT_BENCH_BPS" --argjson new_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,old_bytes_per_second:$old_bps,new_bytes_per_second:$new_bps,selector_verified:true,benchmark:"dl.google.com"}')"
+    exit 0
+fi
 
 OBSERVE_RESULT="$RUN_DIR/observe.json"
 if ! sample_googlevideo "$OBSERVE_SECONDS" "$CHALLENGER" "$OBSERVE_RESULT"; then

@@ -32,6 +32,19 @@ printf '%s' "$sample" | jq -e --arg group MEDIA --arg node node-a --argjson old 
   .map.c1.download == 3000 and .map.c2.upload == 200
 ' >/dev/null
 
+# X activity gate: include x.com/twitter.com/twimg.com subdomains only when the
+# connection belongs to MEDIA and the currently selected node.
+x_sample='{"connections":[{"chains":["node-a","MEDIA"],"metadata":{"host":"api.x.com","sourceIP":"10.0.0.3"}},{"chains":["node-a","MEDIA"],"metadata":{"host":"video.twimg.com","sourceIP":"10.0.0.3"}},{"chains":["node-b","MEDIA"],"metadata":{"host":"x.com","sourceIP":"10.0.0.4"}},{"chains":["node-a","OTHER"],"metadata":{"host":"twitter.com","sourceIP":"10.0.0.5"}}]}'
+printf '%s' "$x_sample" | jq -e --arg group MEDIA --arg node node-a '
+  def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
+    ($h == "x.com" or ($h | endswith(".x.com")) or
+     $h == "twitter.com" or ($h | endswith(".twitter.com")) or
+     $h == "twimg.com" or ($h | endswith(".twimg.com")));
+  [.connections[]? | select(xtraffic) |
+    select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
+    (.metadata.sourceIP // "") | select(length>0)] | unique == ["10.0.0.3"]
+' >/dev/null
+
 # State-file operations used by streaks, penalties and pending validation.
 jq -ne --argjson needed 3 '
   ([1,2,3,4] | .[-$needed:]) == [2,3,4] and

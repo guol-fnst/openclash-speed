@@ -18,6 +18,11 @@ BENCH_MIN_VALID_BYTES=262144
 CHAIN_VERIFY_SECONDS=3
 CHAIN_VERIFY_RATE_BYTES_PER_SEC=65536
 
+# X trigger. Real X/Twitter activity runs at most one existing Google-network
+# throughput comparison per hour. It does not add a separate X state machine.
+X_TRIGGER_ENABLED=1
+X_PROBE_COOLDOWN_SECONDS=3600
+
 # Passive YouTube measurement. All rates are BYTES per second.
 # 1,000,000 bytes/s is approximately 8 Mbps and leaves margin for 1080p.
 YOUTUBE_TARGET_BYTES_PER_SEC=1000000
@@ -55,8 +60,8 @@ INCONCLUSIVE_REQUIRED_COUNT=2
 INCONCLUSIVE_COUNT_MAX_GAP_SECONDS=21600
 PENDING_TIMEOUT_SECONDS=120
 
-# When enabled, only pre-switch googlevideo connection IDs from the triggering
-# source IP are closed. The player is expected to reconnect through new_node.
+# When enabled, only pre-switch connections for the triggering service and
+# source IP are closed. The client is expected to reconnect through new_node.
 KILL_OLD_CONNECTIONS=1
 
 # Persistent and volatile paths.

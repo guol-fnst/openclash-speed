@@ -21,6 +21,10 @@ low_active="$(sed -n 's/^LOW_MIN_ACTIVE_SECONDS=//p' "$CONFIG")"
 [ "$low_active" = 2 ]
 low_bytes="$(sed -n 's/^LOW_MIN_BYTES=//p' "$CONFIG")"
 [ "$low_bytes" = 262144 ]
+x_trigger="$(sed -n 's/^X_TRIGGER_ENABLED=//p' "$CONFIG")"
+[ "$x_trigger" = 1 ]
+x_cooldown="$(sed -n 's/^X_PROBE_COOLDOWN_SECONDS=//p' "$CONFIG")"
+[ "$x_cooldown" = 3600 ]
 stall_enabled="$(sed -n 's/^STALL_PROBE_ENABLED=//p' "$CONFIG")"
 [ "$stall_enabled" = 1 ]
 inconclusive_count="$(sed -n 's/^INCONCLUSIVE_REQUIRED_COUNT=//p' "$CONFIG")"
@@ -67,6 +71,24 @@ if keep 500000 590000 1000000; then
     echo 'decision test unexpectedly kept insufficient improvement' >&2
     exit 1
 fi
+
+# X reuses the active throughput comparison and must beat both thresholds.
+x_switch()
+{
+    current="$1"
+    candidate="$2"
+    [ "$candidate" -ge $((current * 120 / 100)) ] &&
+        [ "$candidate" -ge $((current + 125000)) ]
+}
+x_switch 1000000 1200000
+x_switch 100000 225000
+if x_switch 1000000 1199999 || x_switch 1000000 1125000; then
+    echo 'X threshold test accepted insufficient improvement' >&2
+    exit 1
+fi
+
+grep -F 'event x_access_trigger' "$SCRIPT" >/dev/null
+grep -F 'event x_challenge_success' "$SCRIPT" >/dev/null
 
 # The Ruby portion is exercised when Ruby is available (on the router it is).
 if command -v ruby >/dev/null 2>&1; then
