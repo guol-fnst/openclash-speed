@@ -148,33 +148,34 @@ The previous streak is not refreshed and therefore expires after 180 seconds.
 If a second device begins during the challenge observation, the result becomes
 inconclusive and rolls back.
 
-YouTube remains the primary optimizer and uses real Googlevideo delivery as its
-final verdict. X/Twitter traffic is also an activity trigger. X presence alone is
-not enough: after a matching connection is seen, the script samples `/connections`
-again over a short `X_ACTIVITY_WINDOW_SECONDS` window and requires at least
-`X_MIN_ACTIVITY_BYTES` of measured download delivery from a single device, so an
-idle background X app neither probes nor emits a multi-device deferral. When that
-active-usage check passes without concurrent Googlevideo traffic, at most once
-every 15 minutes the script runs the existing current-node plus candidate
-`dl.google.com` throughput comparison.
+YouTube video remains the primary optimizer and uses real Googlevideo delivery
+as its final verdict. Interactive MEDIA page/API traffic is also an activity
+trigger. This includes X/Twitter, YouTube page/API domains, ChatGPT/OpenAI, and
+GitHub. Presence alone is not enough: after a matching connection is seen, the
+script samples `/connections` again over a short `X_ACTIVITY_WINDOW_SECONDS`
+window and requires at least `X_MIN_ACTIVITY_BYTES` of measured download
+delivery from a single device, so an idle background app neither probes nor
+emits a multi-device deferral. When that active-usage check passes without
+concurrent Googlevideo traffic, at most once every 15 minutes the script runs
+the existing current-node plus candidate `dl.google.com` throughput comparison.
 Per-device byte totals are filtered by that minimum before multi-device counting,
 so a heartbeat from another idle device cannot defer an active user. Googlevideo
 is checked again after the activity window and immediately before writing pending;
-if YouTube appeared meanwhile, the X run exits without changing MEDIA.
+if Googlevideo appeared meanwhile, the page/API run exits without changing MEDIA.
 The current-node benchmark is retried once. A probe that cannot form a valid
 comparison backs off for 5 minutes; only a completed comparison consumes the
 normal 15-minute cooldown.
 It switches MEDIA only when the best candidate is at least 20% and 125000
 bytes/s (about 1 Mbps) faster than the current node. This deliberately assumes
-that a generally faster Google-network path is a useful proxy for X; it does not
-claim to measure X CDN throughput directly.
+that a generally faster Google-network path is a useful proxy for page/API
+traffic; it does not claim to measure each service CDN directly.
 
-An X-triggered run uses the same BENCH listener and chain verification, durable
-pending transaction, selector read-back and external-user protection. On a
-successful switch it closes only the triggering device's pre-switch X,
-Twitter and twimg connections so the client reconnects. It does not run the
-30-second Googlevideo verdict because no YouTube session may exist. YouTube has
-priority whenever both services are active.
+An interactive page/API-triggered run uses the same BENCH listener and chain
+verification, durable pending transaction, selector read-back and external-user
+protection. On a successful switch it closes only the triggering device's
+pre-switch interactive MEDIA connections so the client reconnects. It does not
+run the 30-second Googlevideo verdict because no video session may exist.
+Googlevideo has priority whenever both paths are active.
 
 ## Stall Escape
 

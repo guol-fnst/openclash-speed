@@ -528,14 +528,28 @@ TRIGGER_KIND=youtube
 STALL_TRIGGER=0
 if [ "$HAS_GOOGLEVIDEO" != true ]; then
     [ "$X_TRIGGER_ENABLED" = 1 ] || exit 0
-    # Cheap presence map from the gate snapshot: {id:{download,source}} for X
-    # connections owned by MEDIA and the current node. Empty means no X at all.
+    # Cheap presence map from the gate snapshot: {id:{download,source}} for
+    # interactive MEDIA connections owned by the current node. Empty means no
+    # page/API traffic that can justify a low-volume active probe.
     X_PRESENT_MAP="$(printf '%s' "$GATE_CONNECTIONS" | jq -c \
         --arg group "$MEDIA_GROUP" --arg node "$CURRENT_NODE" '
         def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
           ($h == "x.com" or ($h | endswith(".x.com")) or
            $h == "twitter.com" or ($h | endswith(".twitter.com")) or
-           $h == "twimg.com" or ($h | endswith(".twimg.com")));
+           $h == "twimg.com" or ($h | endswith(".twimg.com")) or
+           $h == "t.co" or ($h | endswith(".t.co")) or
+           $h == "youtube.com" or ($h | endswith(".youtube.com")) or
+           $h == "youtu.be" or ($h | endswith(".youtu.be")) or
+           $h == "ytimg.com" or ($h | endswith(".ytimg.com")) or
+           $h == "youtubei.googleapis.com" or
+           $h == "chatgpt.com" or ($h | endswith(".chatgpt.com")) or
+           $h == "openai.com" or ($h | endswith(".openai.com")) or
+           $h == "oaistatic.com" or ($h | endswith(".oaistatic.com")) or
+           $h == "oaiusercontent.com" or ($h | endswith(".oaiusercontent.com")) or
+           $h == "github.com" or ($h | endswith(".github.com")) or
+           $h == "githubusercontent.com" or ($h | endswith(".githubusercontent.com")) or
+           $h == "githubassets.com" or ($h | endswith(".githubassets.com")) or
+           $h == "github.io" or ($h | endswith(".github.io")));
         [.connections[]? | select(xtraffic) |
           select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
           {key:.id,value:{download:(.download // 0),source:(.metadata.sourceIP // "")}}] | from_entries' 2>/dev/null)" || exit 0
@@ -571,7 +585,20 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
         def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
           ($h == "x.com" or ($h | endswith(".x.com")) or
            $h == "twitter.com" or ($h | endswith(".twitter.com")) or
-           $h == "twimg.com" or ($h | endswith(".twimg.com")));
+           $h == "twimg.com" or ($h | endswith(".twimg.com")) or
+           $h == "t.co" or ($h | endswith(".t.co")) or
+           $h == "youtube.com" or ($h | endswith(".youtube.com")) or
+           $h == "youtu.be" or ($h | endswith(".youtu.be")) or
+           $h == "ytimg.com" or ($h | endswith(".ytimg.com")) or
+           $h == "youtubei.googleapis.com" or
+           $h == "chatgpt.com" or ($h | endswith(".chatgpt.com")) or
+           $h == "openai.com" or ($h | endswith(".openai.com")) or
+           $h == "oaistatic.com" or ($h | endswith(".oaistatic.com")) or
+           $h == "oaiusercontent.com" or ($h | endswith(".oaiusercontent.com")) or
+           $h == "github.com" or ($h | endswith(".github.com")) or
+           $h == "githubusercontent.com" or ($h | endswith(".githubusercontent.com")) or
+           $h == "githubassets.com" or ($h | endswith(".githubassets.com")) or
+           $h == "github.io" or ($h | endswith(".github.io")));
         [.connections[]? | select(xtraffic) |
           select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |
           . as $x | ($old[$x.id] // null) as $p |
@@ -612,7 +639,7 @@ if [ "$HAS_GOOGLEVIDEO" != true ]; then
     event x_access_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" \
         --argjson cooldown "$X_PROBE_COOLDOWN_SECONDS" --argjson failure_backoff "$X_PROBE_FAILURE_BACKOFF_SECONDS" \
         --argjson activity_bytes "$X_ACTIVITY_BYTES" --argjson activity_window "$X_ACTIVITY_WINDOW_SECONDS" \
-        '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,failure_backoff_seconds:$failure_backoff,activity_bytes:$activity_bytes,activity_window_seconds:$activity_window,benchmark:"dl.google.com"}')"
+        '{current_node:$node,source_ip:$source,cooldown_seconds:$cooldown,failure_backoff_seconds:$failure_backoff,activity_bytes:$activity_bytes,activity_window_seconds:$activity_window,scope:"media_interactive",benchmark:"dl.google.com"}')"
 fi
 
 if [ "$TRIGGER_KIND" = youtube ]; then
@@ -1017,7 +1044,20 @@ x_connection_ids()
         def xtraffic: (.metadata.host // "" | ascii_downcase) as $h |
           ($h == "x.com" or ($h | endswith(".x.com")) or
            $h == "twitter.com" or ($h | endswith(".twitter.com")) or
-           $h == "twimg.com" or ($h | endswith(".twimg.com")));
+           $h == "twimg.com" or ($h | endswith(".twimg.com")) or
+           $h == "t.co" or ($h | endswith(".t.co")) or
+           $h == "youtube.com" or ($h | endswith(".youtube.com")) or
+           $h == "youtu.be" or ($h | endswith(".youtu.be")) or
+           $h == "ytimg.com" or ($h | endswith(".ytimg.com")) or
+           $h == "youtubei.googleapis.com" or
+           $h == "chatgpt.com" or ($h | endswith(".chatgpt.com")) or
+           $h == "openai.com" or ($h | endswith(".openai.com")) or
+           $h == "oaistatic.com" or ($h | endswith(".oaistatic.com")) or
+           $h == "oaiusercontent.com" or ($h | endswith(".oaiusercontent.com")) or
+           $h == "github.com" or ($h | endswith(".github.com")) or
+           $h == "githubusercontent.com" or ($h | endswith(".githubusercontent.com")) or
+           $h == "githubassets.com" or ($h | endswith(".githubassets.com")) or
+           $h == "github.io" or ($h | endswith(".github.io")));
         .connections[]? | select(xtraffic) |
         select((.metadata.sourceIP // "") == $source) |
         select((((.chains // []) | index($group)) != null) and (((.chains // []) | index($node)) != null)) |

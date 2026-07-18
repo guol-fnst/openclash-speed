@@ -19,15 +19,15 @@ CHAIN_VERIFY_SECONDS=3
 CHAIN_VERIFY_RATE_BYTES_PER_SEC=65536
 YOUTUBE_PRESELECT_MODE=delay
 
-# X trigger. Real X/Twitter activity runs at most one existing Google-network
-# throughput comparison every 15 minutes. It does not add a separate X state
-# machine.
+# Interactive MEDIA trigger. Real X/Twitter, YouTube page/API, ChatGPT/OpenAI,
+# or GitHub activity runs at most one low-volume Google-network throughput
+# comparison every 15 minutes. It does not add a separate service state machine.
 X_TRIGGER_ENABLED=1
 X_PROBE_COOLDOWN_SECONDS=900
 # A probe that cannot form a valid current-vs-candidate comparison may retry
 # much sooner; it does not consume the normal completion cooldown.
 X_PROBE_FAILURE_BACKOFF_SECONDS=300
-# Real X usage must deliver at least X_MIN_ACTIVITY_BYTES within a short
+# Real usage must deliver at least X_MIN_ACTIVITY_BYTES within a short
 # X_ACTIVITY_WINDOW_SECONDS sample so idle background app connections neither
 # probe nor defer.
 X_ACTIVITY_WINDOW_SECONDS=3
