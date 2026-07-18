@@ -20,11 +20,12 @@ CHAIN_VERIFY_RATE_BYTES_PER_SEC=65536
 YOUTUBE_PRESELECT_MODE=delay
 
 # X trigger. Real X/Twitter activity runs at most one existing Google-network
-# throughput comparison per hour. It does not add a separate X state machine.
+# throughput comparison every 15 minutes. It does not add a separate X state
+# machine.
 X_TRIGGER_ENABLED=1
-X_PROBE_COOLDOWN_SECONDS=3600
+X_PROBE_COOLDOWN_SECONDS=900
 # A probe that cannot form a valid current-vs-candidate comparison may retry
-# much sooner; it does not consume the normal one-hour completion cooldown.
+# much sooner; it does not consume the normal completion cooldown.
 X_PROBE_FAILURE_BACKOFF_SECONDS=300
 # Real X usage must deliver at least X_MIN_ACTIVITY_BYTES within a short
 # X_ACTIVITY_WINDOW_SECONDS sample so idle background app connections neither

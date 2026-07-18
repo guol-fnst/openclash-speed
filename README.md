@@ -153,16 +153,16 @@ not enough: after a matching connection is seen, the script samples `/connection
 again over a short `X_ACTIVITY_WINDOW_SECONDS` window and requires at least
 `X_MIN_ACTIVITY_BYTES` of measured download delivery from a single device, so an
 idle background X app neither probes nor emits a multi-device deferral. When that
-active-usage check passes without concurrent Googlevideo traffic, at most once per
-hour the script runs the existing current-node plus candidate `dl.google.com`
-throughput comparison.
+active-usage check passes without concurrent Googlevideo traffic, at most once
+every 15 minutes the script runs the existing current-node plus candidate
+`dl.google.com` throughput comparison.
 Per-device byte totals are filtered by that minimum before multi-device counting,
 so a heartbeat from another idle device cannot defer an active user. Googlevideo
 is checked again after the activity window and immediately before writing pending;
 if YouTube appeared meanwhile, the X run exits without changing MEDIA.
 The current-node benchmark is retried once. A probe that cannot form a valid
 comparison backs off for 5 minutes; only a completed comparison consumes the
-normal one-hour cooldown.
+normal 15-minute cooldown.
 It switches MEDIA only when the best candidate is at least 20% and 125000
 bytes/s (about 1 Mbps) faster than the current node. This deliberately assumes
 that a generally faster Google-network path is a useful proxy for X; it does not

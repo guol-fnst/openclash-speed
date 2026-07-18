@@ -26,7 +26,7 @@ low_bytes="$(sed -n 's/^LOW_MIN_BYTES=//p' "$CONFIG")"
 x_trigger="$(sed -n 's/^X_TRIGGER_ENABLED=//p' "$CONFIG")"
 [ "$x_trigger" = 1 ]
 x_cooldown="$(sed -n 's/^X_PROBE_COOLDOWN_SECONDS=//p' "$CONFIG")"
-[ "$x_cooldown" = 3600 ]
+[ "$x_cooldown" = 900 ]
 x_failure_backoff="$(sed -n 's/^X_PROBE_FAILURE_BACKOFF_SECONDS=//p' "$CONFIG")"
 [ "$x_failure_backoff" = 300 ]
 x_activity_window="$(sed -n 's/^X_ACTIVITY_WINDOW_SECONDS=//p' "$CONFIG")"
