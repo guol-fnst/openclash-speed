@@ -19,10 +19,9 @@ CHAIN_VERIFY_SECONDS=3
 CHAIN_VERIFY_RATE_BYTES_PER_SEC=65536
 YOUTUBE_PRESELECT_MODE=delay
 
-# Interactive MEDIA trigger. Real X/Twitter, YouTube page/API, ChatGPT/OpenAI,
-# or GitHub activity runs at most one low-volume Google-network throughput
-# comparison every 15 minutes. It does not add a separate service state machine.
-X_TRIGGER_ENABLED=1
+# X/Twitter now uses the independent native X fallback group created by the
+# patcher.  Keep the legacy MEDIA-trigger code disabled.
+X_TRIGGER_ENABLED=0
 X_PROBE_COOLDOWN_SECONDS=900
 # A probe that cannot form a valid current-vs-candidate comparison may retry
 # much sooner; it does not consume the normal completion cooldown.

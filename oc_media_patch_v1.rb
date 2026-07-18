@@ -14,6 +14,7 @@ listeners = cfg['listeners'] ||= []
 
 media_name = 'MEDIA'
 bench_name = 'BENCH'
+x_name = 'X'
 listener_name = 'bench-in'
 begin
   listener_port = Integer(ARGV[1] || '7898', 10)
@@ -29,6 +30,19 @@ real_names = {}
 proxies.each { |p| real_names[p['name']] = true if p.is_a?(Hash) && p['name'] }
 nodes = (base['proxies'] || []).select { |name| real_names[name] }
 abort('no real proxy nodes found in base group') if nodes.empty?
+
+# X needs availability, not video throughput.  Keep it independent from MEDIA
+# and restrict the fallback health checks to known, geographically diverse
+# candidates.  If a subscription renames/removes them, retain a safe small
+# fallback pool rather than creating a group with dead names.
+x_preferred = [
+  '美国03-0.1x | 电信联通移动推荐',
+  '新加坡3 | 高速专线-hy2',
+  '新加坡 | 高速专线-hy2'
+]
+x_nodes = x_preferred.select { |name| nodes.include?(name) }
+x_nodes = nodes.first(3) if x_nodes.length < 2
+abort('not enough subscription nodes for X fallback') if x_nodes.length < 2
 
 # Refuse a port collision instead of silently producing a broken configuration.
 top_level_ports = %w[port socks-port redir-port mixed-port tproxy-port]
@@ -48,11 +62,21 @@ end
 
 # Idempotently rebuild the two groups from real subscription nodes.
 groups.reject! do |group|
-  group.is_a?(Hash) && [media_name, bench_name].include?(group['name'])
+  group.is_a?(Hash) && [media_name, bench_name, x_name].include?(group['name'])
 end
 groups.unshift(
   { 'name' => media_name, 'type' => 'select', 'proxies' => nodes.dup },
-  { 'name' => bench_name, 'type' => 'select', 'proxies' => nodes.dup, 'hidden' => true }
+  { 'name' => bench_name, 'type' => 'select', 'proxies' => nodes.dup, 'hidden' => true },
+  {
+    'name' => x_name,
+    'type' => 'fallback',
+    'proxies' => x_nodes,
+    # A real X endpoint that is only 549 bytes.  It detects X reachability
+    # rather than incorrectly inferring it from Google or Cloudflare.
+    'url' => 'https://x.com/favicon.ico',
+    'interval' => 300,
+    'lazy' => false
+  }
 )
 
 # Preserve unrelated listeners and replace only our named listener.
@@ -73,10 +97,10 @@ custom_rules = [
   'DOMAIN-SUFFIX,googlevideo.com,MEDIA',
   'DOMAIN-SUFFIX,ytimg.com,MEDIA',
   'DOMAIN,youtubei.googleapis.com,MEDIA',
-  'DOMAIN-SUFFIX,x.com,MEDIA',
-  'DOMAIN-SUFFIX,twitter.com,MEDIA',
-  'DOMAIN-SUFFIX,twimg.com,MEDIA',
-  'DOMAIN-SUFFIX,t.co,MEDIA',
+  'DOMAIN-SUFFIX,x.com,X',
+  'DOMAIN-SUFFIX,twitter.com,X',
+  'DOMAIN-SUFFIX,twimg.com,X',
+  'DOMAIN-SUFFIX,t.co,X',
   'DOMAIN-SUFFIX,chatgpt.com,MEDIA',
   'DOMAIN-SUFFIX,openai.com,MEDIA',
   'DOMAIN-SUFFIX,oaistatic.com,MEDIA',
@@ -91,7 +115,7 @@ custom_rules = [
 # a BENCH target in V1.
 rules.reject! do |rule|
   rule.is_a?(String) && (
-    rule.match?(/,(?:MEDIA|BENCH)$/) ||
+    rule.match?(/,(?:MEDIA|BENCH|X)$/) ||
     rule == 'DOMAIN,speed.cloudflare.com,BENCH'
   )
 end
@@ -130,4 +154,4 @@ cfg['profile'] = {} unless cfg['profile'].is_a?(Hash)
 cfg['profile']['store-selected'] = true
 
 File.open(path, 'w') { |file| file.write(YAML.dump(cfg)) }
-puts "oc-media-v1: installed MEDIA/BENCH, #{nodes.length} nodes, bench-in:#{listener_port}, #{custom_rules.length} rules"
+puts "oc-media-v1: installed MEDIA/BENCH/X, #{nodes.length} nodes, X fallback=#{x_nodes.length}, bench-in:#{listener_port}, #{custom_rules.length} rules"

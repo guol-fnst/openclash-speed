@@ -24,7 +24,7 @@ low_active="$(sed -n 's/^LOW_MIN_ACTIVE_SECONDS=//p' "$CONFIG")"
 low_bytes="$(sed -n 's/^LOW_MIN_BYTES=//p' "$CONFIG")"
 [ "$low_bytes" = 262144 ]
 x_trigger="$(sed -n 's/^X_TRIGGER_ENABLED=//p' "$CONFIG")"
-[ "$x_trigger" = 1 ]
+[ "$x_trigger" = 0 ]
 x_cooldown="$(sed -n 's/^X_PROBE_COOLDOWN_SECONDS=//p' "$CONFIG")"
 [ "$x_cooldown" = 900 ]
 x_failure_backoff="$(sed -n 's/^X_PROBE_FAILURE_BACKOFF_SECONDS=//p' "$CONFIG")"
@@ -114,12 +114,15 @@ if command -v ruby >/dev/null 2>&1; then
       b=c["listeners"].find{|x| x["name"]=="bench-in"};
       abort unless b && b["port"]==7898 && b["proxy"]=="BENCH" && b["users"]==[];
       abort unless c["proxy-groups"].find{|x| x["name"]=="MEDIA"}["proxies"]==["新加坡 A","美国 B"];
+      x=c["proxy-groups"].find{|g| g["name"]=="X"};
+      abort unless x && x["type"]=="fallback" && x["url"]=="https://x.com/favicon.ico" && x["interval"]==300 && x["lazy"]==false;
       abort unless c.dig("profile","store-selected")==true;
       rules=c["rules"];
       reject_i=rules.index("DOMAIN,ads.example,🛑 全球拦截");
       media_i=rules.index("DOMAIN-SUFFIX,youtube.com,MEDIA");
+      x_i=rules.index("DOMAIN-SUFFIX,x.com,X");
       legacy_i=rules.index("DOMAIN-SUFFIX,youtube.com,旧媒体组");
-      abort unless reject_i < media_i && media_i < legacy_i;
+      abort unless reject_i < media_i && reject_i < x_i && media_i < legacy_i;
     ' "$tmp"
     # A second pass must be idempotent.
     ruby "$PATCHER" "$tmp" >/dev/null
@@ -128,6 +131,7 @@ if command -v ruby >/dev/null 2>&1; then
       abort unless c["listeners"].count{|x| x["name"]=="bench-in"}==1;
       abort unless c["proxy-groups"].count{|x| x["name"]=="MEDIA"}==1;
       abort unless c["proxy-groups"].count{|x| x["name"]=="BENCH"}==1;
+      abort unless c["proxy-groups"].count{|x| x["name"]=="X"}==1;
     ' "$tmp"
 fi
 

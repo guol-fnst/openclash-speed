@@ -1,4 +1,4 @@
-# OpenClash YouTube/X/ChatGPT/GitHub MEDIA selector V1.4.1
+# OpenClash YouTube selector + independent X fallback V1.5.0
 
 This directory is the reviewable source of the router deployment.
 `config.example` deliberately defaults to `ENABLED=0`; the deployed router
@@ -8,9 +8,9 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 
 - `oc-media-speed-select-v1` — cron entry point and complete state machine.
 - `config.example` — documented defaults; all throughput values are bytes/s.
-- `oc_media_patch_v1.rb` — idempotently rebuilds MEDIA/BENCH, persists
-  `bench-in:7898`, keeps unrelated listeners, and installs
-  YouTube/X/ChatGPT/GitHub rules.
+- `oc_media_patch_v1.rb` — idempotently rebuilds MEDIA/BENCH and an
+  independent native X fallback group, persists `bench-in:7898`, keeps
+  unrelated listeners, and installs service rules.
 - `openclash_custom_overwrite.snippet` — the one line that would be added to
   OpenClash's existing subscription overwrite hook. It reads only the numeric
   listener port from the selector config before invoking the Ruby patcher.
@@ -148,34 +148,21 @@ The previous streak is not refreshed and therefore expires after 180 seconds.
 If a second device begins during the challenge observation, the result becomes
 inconclusive and rolls back.
 
-YouTube video remains the primary optimizer and uses real Googlevideo delivery
-as its final verdict. Interactive MEDIA page/API traffic is also an activity
-trigger. This includes X/Twitter, YouTube page/API domains, ChatGPT/OpenAI, and
-GitHub. Presence alone is not enough: after a matching connection is seen, the
-script samples `/connections` again over a short `X_ACTIVITY_WINDOW_SECONDS`
-window and requires at least `X_MIN_ACTIVITY_BYTES` of measured download
-delivery from a single device, so an idle background app neither probes nor
-emits a multi-device deferral. When that active-usage check passes without
-concurrent Googlevideo traffic, at most once every 15 minutes the script runs
-the existing current-node plus candidate `dl.google.com` throughput comparison.
-Per-device byte totals are filtered by that minimum before multi-device counting,
-so a heartbeat from another idle device cannot defer an active user. Googlevideo
-is checked again after the activity window and immediately before writing pending;
-if Googlevideo appeared meanwhile, the page/API run exits without changing MEDIA.
-The current-node benchmark is retried once. A probe that cannot form a valid
-comparison backs off for 5 minutes; only a completed comparison consumes the
-normal 15-minute cooldown.
-It switches MEDIA only when the best candidate is at least 20% and 125000
-bytes/s (about 1 Mbps) faster than the current node. This deliberately assumes
-that a generally faster Google-network path is a useful proxy for page/API
-traffic; it does not claim to measure each service CDN directly.
+YouTube video remains the only automatic selector workload.  It uses real
+Googlevideo delivery as its final verdict.
 
-An interactive page/API-triggered run uses the same BENCH listener and chain
-verification, durable pending transaction, selector read-back and external-user
-protection. On a successful switch it closes only the triggering device's
-pre-switch interactive MEDIA connections so the client reconnects. It does not
-run the 30-second Googlevideo verdict because no video session may exist.
-Googlevideo has priority whenever both paths are active.
+X/Twitter is intentionally not optimized by this script: Google throughput is
+not evidence for X API reachability.  The patcher routes X/Twitter domains to
+the independent native `X` fallback group.  Its three candidates are health
+checked against `https://x.com/favicon.ico` every five minutes; the response is
+only 549 bytes in current testing.  The group keeps its preferred first healthy
+node and moves to the next one only when the X-specific health check fails. It
+does not pursue marginal speed improvements and cannot alter YouTube's MEDIA
+node. `X_TRIGGER_ENABLED=0` preserves this separation by disabling the legacy
+interactive benchmark path.
+
+ChatGPT/OpenAI and GitHub remain explicit MEDIA rules for now, but do not start
+new selector runs while the legacy interactive trigger is disabled.
 
 ## Stall Escape
 
