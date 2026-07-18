@@ -76,7 +76,15 @@ custom_rules = [
   'DOMAIN-SUFFIX,x.com,MEDIA',
   'DOMAIN-SUFFIX,twitter.com,MEDIA',
   'DOMAIN-SUFFIX,twimg.com,MEDIA',
-  'DOMAIN-SUFFIX,t.co,MEDIA'
+  'DOMAIN-SUFFIX,t.co,MEDIA',
+  'DOMAIN-SUFFIX,chatgpt.com,MEDIA',
+  'DOMAIN-SUFFIX,openai.com,MEDIA',
+  'DOMAIN-SUFFIX,oaistatic.com,MEDIA',
+  'DOMAIN-SUFFIX,oaiusercontent.com,MEDIA',
+  'DOMAIN-SUFFIX,github.com,MEDIA',
+  'DOMAIN-SUFFIX,githubusercontent.com,MEDIA',
+  'DOMAIN-SUFFIX,githubassets.com,MEDIA',
+  'DOMAIN-SUFFIX,github.io,MEDIA'
 ]
 
 # Remove only rules previously owned by this feature. Cloudflare is no longer
@@ -94,6 +102,8 @@ end
 media_domains = %w[
   youtube.com youtu.be googlevideo.com ytimg.com youtubei.googleapis.com
   x.com twitter.com twimg.com t.co
+  chatgpt.com openai.com oaistatic.com oaiusercontent.com
+  github.com githubusercontent.com githubassets.com github.io
 ]
 rule_target = lambda do |rule|
   fields = rule.is_a?(String) ? rule.split(',') : []

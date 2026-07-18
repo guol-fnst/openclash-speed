@@ -1,4 +1,4 @@
-# OpenClash YouTube/X MEDIA selector V1.4.0
+# OpenClash YouTube/X/ChatGPT/GitHub MEDIA selector V1.4.1
 
 This directory is the reviewable source of the router deployment.
 `config.example` deliberately defaults to `ENABLED=0`; the deployed router
@@ -9,7 +9,8 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 - `oc-media-speed-select-v1` — cron entry point and complete state machine.
 - `config.example` — documented defaults; all throughput values are bytes/s.
 - `oc_media_patch_v1.rb` — idempotently rebuilds MEDIA/BENCH, persists
-  `bench-in:7898`, keeps unrelated listeners, and installs YouTube/X rules.
+  `bench-in:7898`, keeps unrelated listeners, and installs
+  YouTube/X/ChatGPT/GitHub rules.
 - `openclash_custom_overwrite.snippet` — the one line that would be added to
   OpenClash's existing subscription overwrite hook. It reads only the numeric
   listener port from the selector config before invoking the Ruby patcher.
@@ -19,7 +20,7 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 There is intentionally no installer script. Deployment remains a separate,
 explicit and backed-up operation.
 
-## Exact V1.4.0 behavior
+## Exact V1.4.1 behavior
 
 Every cron run takes a kernel `flock`. It then handles a durable pending
 transaction before looking at `ENABLED`:
@@ -211,6 +212,6 @@ at the configured size.
 /etc/crontabs/root                                   # once per minute
 ```
 
-V1.4 replaced only the selector and its configuration. The existing Ruby
+V1.4.1 replaced only the patcher rules. The existing selector, configuration,
 patcher, overwrite hook and cron entry were retained. Future changes should use
 the same lock, backup and atomic-replace procedure.
