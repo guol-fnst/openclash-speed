@@ -1,4 +1,4 @@
-# OpenClash YouTube/X MEDIA selector V1.3.3
+# OpenClash YouTube/X MEDIA selector V1.4.0
 
 This directory is the reviewable source of the router deployment.
 `config.example` deliberately defaults to `ENABLED=0`; the deployed router
@@ -19,7 +19,7 @@ configuration keeps its separately reviewed `ENABLED=1` value.
 There is intentionally no installer script. Deployment remains a separate,
 explicit and backed-up operation.
 
-## Exact V1.3.3 behavior
+## Exact V1.4.0 behavior
 
 Every cron run takes a kernel `flock`. It then handles a durable pending
 transaction before looking at `ENABLED`:
@@ -44,26 +44,17 @@ When enabled and real Googlevideo traffic exists:
   -> trigger preselection
 ```
 
-The preselection stage calls `/group/BENCH/delay` with the gstatic 204 URL,
-keeps delays below 800 ms, excludes penalties, and selects at most three
-non-current challengers. Each node first gets a three-second, 64 KiB/s preflight
-whose only purpose is keeping the connection visible for chains verification.
-The current node and challengers are then each tested once for up to four
-seconds and 12 MiB against the configurable `dl.google.com` Chrome MSI.
+The YouTube preselection stage defaults to low-traffic mode. It calls
+`/group/BENCH/delay` with the gstatic 204 URL, keeps delays below 800 ms,
+excludes penalties, and selects at most three non-current challengers. It does
+not run a `dl.google.com` range download for YouTube; real Googlevideo delivery
+remains the verdict.
 
-Every request goes through `127.0.0.1:7898`, which is directly bound to BENCH.
-The formal download result is accepted only when all of these are true:
-
-- curl returns 0 or timeout 28 with usable partial data;
-- HTTP is 200/206 and at least 256 KiB was downloaded;
-- `/connections` shows loopback source, `dl.google.com`, and chains containing
-  both BENCH and the selected candidate during the dedicated preflight;
-- BENCH still selects the candidate after the formal download.
-
-The current node's active result is diagnostic only. Because the passive data
-has already shown that it is slow for YouTube, the highest-throughput valid
-*non-current* candidate becomes the challenger even when current dl.google
-throughput is higher.
+`dl.google.com` active range tests are still used for X-triggered runs, where no
+Googlevideo session may exist. The default cap is 1 MiB per node and two seconds.
+Each tested node first gets a three-second, 64 KiB/s preflight whose only
+purpose is keeping the connection visible for chains verification. Every request
+goes through `127.0.0.1:7898`, which is directly bound to BENCH.
 
 Immediately before mutation the script re-reads `ENABLED`, `MEDIA.now`, and
 MEDIA membership. It snapshots only old Googlevideo connection IDs matching
@@ -104,7 +95,13 @@ new >= old * 1.20
 new >= old + 125000 bytes/s   # approximately 1 Mbps
 ```
 
-`SELECTOR_AFTER_OBSERVE` is verified before this calculation. Once KEEP is
+For stall-escape challenges, a deliberately lower keep floor also exists: the
+challenger may be kept after at least one active second, 512 KiB total delivery,
+and 250000 bytes/s. This path is only entered after repeated request/connection
+churn with almost no delivery on the old node. If it succeeds, the replaced
+stalled champion is blacklisted for 6 hours.
+
+`SELECTOR_AFTER_OBSERVE` is verified before the KEEP calculation. Once KEEP is
 decided, pending is cleared without a second API read: a transient control-plane
 failure must not turn an already validated winner into a future timeout rollback.
 
@@ -178,24 +175,21 @@ Twitter and twimg connections so the client reconnects. It does not run the
 30-second Googlevideo verdict because no YouTube session may exist. YouTube has
 priority whenever both services are active.
 
-## Diagnostic-only stall probe
+## Stall Escape
 
-V1.1 records connection churn so the champion-side "too dead to produce a
-valid slow sample" blind spot can be measured safely. A window is stall-like
-only when one active source creates at least one new Googlevideo connection,
-uploads request bytes, and receives less than 128 KiB. Any meaningful delivery
-immediately clears the sequence. Three consecutive matching windows produce:
+The stall probe covers the champion-side "too dead to produce a valid slow
+sample" blind spot. A window is stall-like only when one active source creates
+at least one new Googlevideo connection, uploads request bytes, and receives
+less than 128 KiB. Any meaningful delivery immediately clears the sequence.
+Three consecutive matching windows produce `stall_suspected` with
+`action:"escape_enabled"`, then start the challenge path:
 
 ```json
-{"event":"stall_suspected","action":"log_only"}
+{"event":"stall_escape_trigger"}
 ```
 
-The probe has no control-plane action: it does not benchmark, switch MEDIA,
-close connections, or penalize a node. After 3–7 days of false-positive review,
-a future escape mode may use a deliberately low keep floor of 250000 bytes/s
-(about 2 Mbps), then blacklist the replaced stalled champion for 21600 seconds
-only after the challenger demonstrates real Googlevideo delivery. Those two
-values are design notes, not active V1.1 behavior.
+The old node is only penalized after the challenger demonstrates real
+Googlevideo delivery and is kept.
 
 ## Logging
 
@@ -217,6 +211,6 @@ at the configured size.
 /etc/crontabs/root                                   # once per minute
 ```
 
-V1.3 replaced only the selector and its configuration. The existing Ruby
+V1.4 replaced only the selector and its configuration. The existing Ruby
 patcher, overwrite hook and cron entry were retained. Future changes should use
 the same lock, backup and atomic-replace procedure.

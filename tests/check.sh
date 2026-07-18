@@ -14,7 +14,9 @@ fi
 enabled="$(sed -n 's/^ENABLED=//p' "$CONFIG")"
 [ "$enabled" = 0 ]
 max_bytes="$(sed -n 's/^BENCH_MAX_BYTES=//p' "$CONFIG")"
-[ "$max_bytes" = 12582912 ]
+[ "$max_bytes" = 1048576 ]
+yt_preselect="$(sed -n 's/^YOUTUBE_PRESELECT_MODE=//p' "$CONFIG")"
+[ "$yt_preselect" = delay ]
 fast_bytes="$(sed -n 's/^FAST_POSITIVE_MIN_BYTES=//p' "$CONFIG")"
 [ "$fast_bytes" = 4194304 ]
 low_active="$(sed -n 's/^LOW_MIN_ACTIVE_SECONDS=//p' "$CONFIG")"
@@ -33,6 +35,8 @@ x_min_activity="$(sed -n 's/^X_MIN_ACTIVITY_BYTES=//p' "$CONFIG")"
 [ "$x_min_activity" = 65536 ]
 stall_enabled="$(sed -n 's/^STALL_PROBE_ENABLED=//p' "$CONFIG")"
 [ "$stall_enabled" = 1 ]
+stall_escape="$(sed -n 's/^STALL_ESCAPE_ENABLED=//p' "$CONFIG")"
+[ "$stall_escape" = 1 ]
 inconclusive_count="$(sed -n 's/^INCONCLUSIVE_REQUIRED_COUNT=//p' "$CONFIG")"
 [ "$inconclusive_count" = 2 ]
 "$ROOT/tests/low_threshold_v12.sh" "$CONFIG"

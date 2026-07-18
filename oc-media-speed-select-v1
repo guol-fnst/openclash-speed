@@ -22,6 +22,7 @@ CONFIG="${CONFIG:-/etc/openclash/speed-select/config}"
 : "${BENCH_MIN_VALID_BYTES:=262144}"
 : "${CHAIN_VERIFY_SECONDS:=3}"
 : "${CHAIN_VERIFY_RATE_BYTES_PER_SEC:=65536}"
+: "${YOUTUBE_PRESELECT_MODE:=delay}"
 : "${X_TRIGGER_ENABLED:=1}"
 : "${X_PROBE_COOLDOWN_SECONDS:=3600}"
 : "${X_PROBE_FAILURE_BACKOFF_SECONDS:=300}"
@@ -44,6 +45,11 @@ CONFIG="${CONFIG:-/etc/openclash/speed-select/config}"
 : "${STALL_MIN_UPLOAD_BYTES:=1}"
 : "${STALL_MAX_BYTES:=131072}"
 : "${STALL_MAX_GAP_SECONDS:=180}"
+: "${STALL_ESCAPE_ENABLED:=1}"
+: "${STALL_BASELINE_BYTES_PER_SEC:=1}"
+: "${STALL_KEEP_MIN_ACTIVE_SECONDS:=1}"
+: "${STALL_KEEP_MIN_BYTES:=524288}"
+: "${STALL_KEEP_MIN_BYTES_PER_SEC:=250000}"
 : "${KEEP_RATIO_PERCENT:=120}"
 : "${KEEP_MIN_DELTA_BYTES_PER_SEC:=125000}"
 : "${CHALLENGE_BACKOFF_SECONDS:=600}"
@@ -90,6 +96,9 @@ for value in "$BENCH_PROXY_PORT" "$MAX_DELAY_MS" "$MAX_CHALLENGERS" \
     "$STALL_PROBE_ENABLED" "$STALL_REQUIRED_WINDOWS" \
     "$STALL_MIN_NEW_CONNECTIONS" "$STALL_MIN_UPLOAD_BYTES" \
     "$STALL_MAX_BYTES" "$STALL_MAX_GAP_SECONDS" \
+    "$STALL_ESCAPE_ENABLED" "$STALL_BASELINE_BYTES_PER_SEC" \
+    "$STALL_KEEP_MIN_ACTIVE_SECONDS" "$STALL_KEEP_MIN_BYTES" \
+    "$STALL_KEEP_MIN_BYTES_PER_SEC" \
     "$KEEP_RATIO_PERCENT" "$KEEP_MIN_DELTA_BYTES_PER_SEC" \
     "$CHALLENGE_BACKOFF_SECONDS" "$FAILED_BLACKLIST_SECONDS" \
     "$INCONCLUSIVE_RETRY_SECONDS" "$INCONCLUSIVE_REQUIRED_COUNT" \
@@ -490,9 +499,11 @@ log_passive_window()
         '.+{status:$status,stall_window:($stall_match==1),stall_streak:$stall_streak}')"
     event "$name" "$detail"
     if [ "$STALL_SUSPECTED_NEW" -eq 1 ]; then
+        stall_action=log_only
+        [ "$STALL_ESCAPE_ENABLED" = 1 ] && stall_action=escape_enabled
         event stall_suspected "$(printf '%s' "$detail" | jq -c \
-            --argjson required "$STALL_REQUIRED_WINDOWS" \
-            '.+{required_windows:$required,action:"log_only"}')"
+            --argjson required "$STALL_REQUIRED_WINDOWS" --arg action "$stall_action" \
+            '.+{required_windows:$required,action:$action}')"
     fi
 }
 
@@ -514,6 +525,7 @@ GATE_CONNECTIONS="$(api "$API_BASE/connections" 2>/dev/null)" || exit 0
 HAS_GOOGLEVIDEO="$(printf '%s' "$GATE_CONNECTIONS" | connections_have_googlevideo "$CURRENT_NODE" 2>/dev/null)" || exit 0
 
 TRIGGER_KIND=youtube
+STALL_TRIGGER=0
 if [ "$HAS_GOOGLEVIDEO" != true ]; then
     [ "$X_TRIGGER_ENABLED" = 1 ] || exit 0
     # Cheap presence map from the gate snapshot: {id:{download,source}} for X
@@ -625,6 +637,29 @@ if [ "$SOURCE_COUNT" -gt 1 ]; then
     exit 0
 fi
 
+if [ "$STALL_ESCAPE_ENABLED" = 1 ] && [ "$STALL_SUSPECTED_NEW" -eq 1 ]; then
+    TRIGGER_SOURCE="$(printf '%s' "$PASSIVE_JSON" | jq -r '.activity_source_ips[0] // empty')"
+    [ -n "$TRIGGER_SOURCE" ] || {
+        log_passive_window passive_sample insufficient
+        exit 0
+    }
+    NOW="$(date +%s)"
+    LAST_ATTEMPT=0
+    [ -r "$LAST_ATTEMPT_FILE" ] && LAST_ATTEMPT="$(cat "$LAST_ATTEMPT_FILE" 2>/dev/null)"
+    is_uint "$LAST_ATTEMPT" || LAST_ATTEMPT=0
+    if [ $((NOW - LAST_ATTEMPT)) -lt "$CHALLENGE_BACKOFF_SECONDS" ]; then
+        log_passive_window passive_sample insufficient
+        event stall_escape_deferred "$(jq -nc --argjson retry_after "$((LAST_ATTEMPT + CHALLENGE_BACKOFF_SECONDS))" '{cause:"challenge_backoff",retry_after:$retry_after}')"
+        exit 0
+    fi
+    BASELINE_BPS="$STALL_BASELINE_BYTES_PER_SEC"
+    STALL_TRIGGER=1
+    durable_write "$LAST_ATTEMPT_FILE" "$NOW" || exit 1
+    rm -f "$LOW_STREAK_FILE"
+    log_passive_window passive_sample insufficient
+    event stall_escape_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson baseline "$BASELINE_BPS" '{old_node:$node,source_ip:$source,baseline_bytes_per_active_second:$baseline}')"
+else
+
 if [ "$SOURCE_COUNT" -eq 1 ] && [ "$PASSIVE_BPS" -ge "$YOUTUBE_TARGET_BYTES_PER_SEC" ] && \
    { { [ "$PASSIVE_ACTIVE" -ge "$LOW_MIN_ACTIVE_SECONDS" ] && [ "$PASSIVE_BYTES" -ge "$LOW_MIN_BYTES" ]; } || \
      { [ "$PASSIVE_ACTIVE" -ge "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" ] && [ "$PASSIVE_BYTES" -ge "$FAST_POSITIVE_MIN_BYTES" ]; }; }; then
@@ -694,6 +729,7 @@ durable_write "$LAST_ATTEMPT_FILE" "$NOW" || exit 1
 rm -f "$LOW_STREAK_FILE"
 event low_speed_trigger "$(jq -nc --arg node "$CURRENT_NODE" --arg source "$TRIGGER_SOURCE" --argjson bps "$BASELINE_BPS" --argjson target "$YOUTUBE_TARGET_BYTES_PER_SEC" '{old_node:$node,source_ip:$source,baseline_bytes_per_active_second:$bps,target_bytes_per_second:$target}')"
 
+fi
 fi
 
 penalty_until()
@@ -896,18 +932,30 @@ benchmark_node()
 
 : > "$RUN_DIR/results"
 sequence=0
-while IFS= read -r node; do
-    [ -n "$node" ] || continue
-    delay="$(printf '%s' "$DELAY_JSON" | jq -r --arg node "$node" '.[$node] // 99999')"
-    sequence=$((sequence + 1))
-    if ! benchmark_node "$node" "$delay" "$sequence"; then
-        if [ "$TRIGGER_KIND" = x ] && [ "$node" = "$CURRENT_NODE" ]; then
-            event x_current_benchmark_retry "$(jq -nc --arg node "$node" '{node:$node,attempt:2}')"
-            sequence=$((sequence + 1))
-            benchmark_node "$node" "$delay" "$sequence" || true
+if [ "$TRIGGER_KIND" = youtube ] && [ "$YOUTUBE_PRESELECT_MODE" = delay ]; then
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        delay="$(printf '%s' "$DELAY_JSON" | jq -r --arg node "$node" '.[$node] // 99999')"
+        is_uint "$delay" || delay=99999
+        score=$((1000000 - delay))
+        [ "$score" -lt 1 ] && score=1
+        event candidate_probe_skipped "$(jq -nc --arg node "$node" --argjson delay "$delay" --arg trigger "$TRIGGER_KIND" '{node:$node,trigger:$trigger,method:"delay_only",delay_ms:$delay,download_bytes:0,bytes_per_second:0}')"
+        printf '%s\t%s\t%s\n' "$node" "$score" "$delay" >> "$RUN_DIR/results"
+    done < "$CANDIDATES"
+else
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        delay="$(printf '%s' "$DELAY_JSON" | jq -r --arg node "$node" '.[$node] // 99999')"
+        sequence=$((sequence + 1))
+        if ! benchmark_node "$node" "$delay" "$sequence"; then
+            if [ "$TRIGGER_KIND" = x ] && [ "$node" = "$CURRENT_NODE" ]; then
+                event x_current_benchmark_retry "$(jq -nc --arg node "$node" '{node:$node,attempt:2}')"
+                sequence=$((sequence + 1))
+                benchmark_node "$node" "$delay" "$sequence" || true
+            fi
         fi
-    fi
-done < "$CANDIDATES"
+    done < "$CANDIDATES"
+fi
 
 CHALLENGER="$(awk -F '\t' -v current="$CURRENT_NODE" '$1!=current {if(!found || $2>best){found=1;best=$2;node=$1}} END{print node}' "$RUN_DIR/results")"
 if [ -z "$CHALLENGER" ]; then
@@ -915,6 +963,9 @@ if [ -z "$CHALLENGER" ]; then
     exit 0
 fi
 CHALLENGER_BPS="$(awk -F '\t' -v node="$CHALLENGER" '$1==node {print $2;exit}' "$RUN_DIR/results")"
+if [ "$TRIGGER_KIND" = youtube ] && [ "$YOUTUBE_PRESELECT_MODE" = delay ]; then
+    CHALLENGER_BPS=0
+fi
 
 if [ "$TRIGGER_KIND" = x ]; then
     CURRENT_BENCH_BPS="$(awk -F '\t' -v node="$CURRENT_NODE" '$1==node {print $2;exit}' "$RUN_DIR/results")"
@@ -1023,7 +1074,7 @@ write_pending "$CURRENT_NODE" "$CHALLENGER" "$TRIGGER_SOURCE" || {
 if [ "$TRIGGER_KIND" = x ]; then
     event x_challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson current_bps "$CURRENT_BENCH_BPS" --argjson candidate_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,source_ip:$source,current_bytes_per_second:$current_bps,candidate_bytes_per_second:$candidate_bps}')"
 else
-    event challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson baseline "$BASELINE_BPS" --argjson preselect_bps "$CHALLENGER_BPS" '{old_node:$old,new_node:$new,source_ip:$source,baseline_bytes_per_active_second:$baseline,preselection_bytes_per_second:$preselect_bps}')"
+    event challenge_started "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --arg source "$TRIGGER_SOURCE" --argjson baseline "$BASELINE_BPS" --argjson preselect_bps "$CHALLENGER_BPS" --arg mode "$YOUTUBE_PRESELECT_MODE" --argjson stall "$STALL_TRIGGER" '{old_node:$old,new_node:$new,source_ip:$source,baseline_bytes_per_active_second:$baseline,preselection_bytes_per_second:$preselect_bps,preselection_mode:$mode,stall_escape:($stall==1)}')"
 fi
 
 if ! put_selection "$MEDIA_GROUP" "$CHALLENGER" || ! verify_selection "$MEDIA_GROUP" "$CHALLENGER"; then
@@ -1092,6 +1143,7 @@ fi
 sample_owner_valid=0
 standard_sample=0
 fast_positive_sample=0
+stall_alive_sample=0
 if [ "$NEW_SOURCE_COUNT" -eq 1 ] && [ "$NEW_SOURCE" = "$TRIGGER_SOURCE" ]; then
     sample_owner_valid=1
     if [ "$NEW_ACTIVE" -ge "$OBSERVE_MIN_ACTIVE_SECONDS" ] && [ "$NEW_BYTES" -ge "$OBSERVE_MIN_BYTES" ]; then
@@ -1100,18 +1152,28 @@ if [ "$NEW_SOURCE_COUNT" -eq 1 ] && [ "$NEW_SOURCE" = "$TRIGGER_SOURCE" ]; then
     if [ "$NEW_ACTIVE" -ge "$FAST_POSITIVE_MIN_ACTIVE_SECONDS" ] && [ "$NEW_BYTES" -ge "$FAST_POSITIVE_MIN_BYTES" ]; then
         fast_positive_sample=1
     fi
+    if [ "$STALL_TRIGGER" -eq 1 ] && \
+       [ "$NEW_ACTIVE" -ge "$STALL_KEEP_MIN_ACTIVE_SECONDS" ] && \
+       [ "$NEW_BYTES" -ge "$STALL_KEEP_MIN_BYTES" ] && \
+       [ "$NEW_BPS" -ge "$STALL_KEEP_MIN_BYTES_PER_SEC" ]; then
+        stall_alive_sample=1
+    fi
 fi
 
 if [ "$sample_owner_valid" -eq 1 ] && \
-   { [ "$standard_sample" -eq 1 ] || [ "$fast_positive_sample" -eq 1 ]; } && \
-   { [ "$target_reached" -eq 1 ] || [ "$material_improvement" -eq 1 ]; }; then
+   { { [ "$standard_sample" -eq 1 ] || [ "$fast_positive_sample" -eq 1 ]; } && \
+     { [ "$target_reached" -eq 1 ] || [ "$material_improvement" -eq 1 ]; } || \
+     [ "$stall_alive_sample" -eq 1 ]; }; then
     # SELECTOR_AFTER_OBSERVE was already verified immediately before the KEEP
     # calculation. A second control-plane read adds a failure mode but cannot
     # make this commit atomic; once the data verdict is KEEP, pending must never
     # later be interpreted as an in-progress challenge and rolled back.
     clear_inconclusive_count "$CHALLENGER"
     clear_pending
-    event challenge_success "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson old_bps "$BASELINE_BPS" --argjson new_bps "$NEW_BPS" --argjson target "$target_reached" --argjson material "$material_improvement" --argjson fast "$fast_positive_sample" '{old_node:$old,new_node:$new,old_bytes_per_active_second:$old_bps,new_bytes_per_active_second:$new_bps,target_reached:($target==1),material_improvement:($material==1),fast_positive_sample:($fast==1),selector_verified_after_observation:true}')"
+    if [ "$STALL_TRIGGER" -eq 1 ]; then
+        set_penalty "$CURRENT_NODE" failed "$FAILED_BLACKLIST_SECONDS" || true
+    fi
+    event challenge_success "$(jq -nc --arg old "$CURRENT_NODE" --arg new "$CHALLENGER" --argjson old_bps "$BASELINE_BPS" --argjson new_bps "$NEW_BPS" --argjson target "$target_reached" --argjson material "$material_improvement" --argjson fast "$fast_positive_sample" --argjson stall_alive "$stall_alive_sample" --argjson stall "$STALL_TRIGGER" '{old_node:$old,new_node:$new,old_bytes_per_active_second:$old_bps,new_bytes_per_active_second:$new_bps,target_reached:($target==1),material_improvement:($material==1),fast_positive_sample:($fast==1),stall_alive_sample:($stall_alive==1),stall_escape:($stall==1),selector_verified_after_observation:true}')"
     exit 0
 fi
 
